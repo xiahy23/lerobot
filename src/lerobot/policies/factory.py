@@ -32,11 +32,13 @@ from lerobot.envs.utils import env_to_policy_features
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.groot.configuration_groot import GrootConfig
+from lerobot.policies.mot.configuration_mot import MoTConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.sac.configuration_sac import SACConfig
-from lerobot.policies.sac.reward_model.configuration_classifier import RewardClassifierConfig
+from lerobot.policies.sac.reward_model.configuration_classifier import \
+    RewardClassifierConfig
 from lerobot.policies.sarm.configuration_sarm import SARMConfig
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.tdmpc.configuration_tdmpc import TDMPCConfig
@@ -45,17 +47,12 @@ from lerobot.policies.vqbet.configuration_vqbet import VQBeTConfig
 from lerobot.policies.wall_x.configuration_wall_x import WallXConfig
 from lerobot.policies.xvla.configuration_xvla import XVLAConfig
 from lerobot.processor import PolicyAction, PolicyProcessorPipeline
-from lerobot.processor.converters import (
-    batch_to_transition,
-    policy_action_to_transition,
-    transition_to_batch,
-    transition_to_policy_action,
-)
-from lerobot.utils.constants import (
-    ACTION,
-    POLICY_POSTPROCESSOR_DEFAULT_NAME,
-    POLICY_PREPROCESSOR_DEFAULT_NAME,
-)
+from lerobot.processor.converters import (batch_to_transition,
+                                          policy_action_to_transition,
+                                          transition_to_batch,
+                                          transition_to_policy_action)
+from lerobot.utils.constants import (ACTION, POLICY_POSTPROCESSOR_DEFAULT_NAME,
+                                     POLICY_PREPROCESSOR_DEFAULT_NAME)
 
 
 def get_policy_class(name: str) -> type[PreTrainedPolicy]:
@@ -80,7 +77,8 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
 
         return TDMPCPolicy
     elif name == "diffusion":
-        from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
+        from lerobot.policies.diffusion.modeling_diffusion import \
+            DiffusionPolicy
 
         return DiffusionPolicy
     elif name == "act":
@@ -108,7 +106,8 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
 
         return SACPolicy
     elif name == "reward_classifier":
-        from lerobot.policies.sac.reward_model.modeling_classifier import Classifier
+        from lerobot.policies.sac.reward_model.modeling_classifier import \
+            Classifier
 
         return Classifier
     elif name == "smolvla":
@@ -131,6 +130,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.wall_x.modeling_wall_x import WallXPolicy
 
         return WallXPolicy
+    elif name == "mot":
+        from lerobot.policies.mot.modeling_mot import MoTPolicy
+
+        return MoTPolicy
     else:
         try:
             return _get_policy_cls_from_policy_name(name=name)
@@ -181,6 +184,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return XVLAConfig(**kwargs)
     elif policy_type == "wall_x":
         return WallXConfig(**kwargs)
+    elif policy_type == "mot":
+        return MoTConfig(**kwargs)
     else:
         try:
             config_cls = PreTrainedConfig.get_choice_class(policy_type)
@@ -286,7 +291,8 @@ def make_pre_post_processors(
 
     # Create a new processor based on policy type
     if isinstance(policy_cfg, TDMPCConfig):
-        from lerobot.policies.tdmpc.processor_tdmpc import make_tdmpc_pre_post_processors
+        from lerobot.policies.tdmpc.processor_tdmpc import \
+            make_tdmpc_pre_post_processors
 
         processors = make_tdmpc_pre_post_processors(
             config=policy_cfg,
@@ -294,7 +300,8 @@ def make_pre_post_processors(
         )
 
     elif isinstance(policy_cfg, DiffusionConfig):
-        from lerobot.policies.diffusion.processor_diffusion import make_diffusion_pre_post_processors
+        from lerobot.policies.diffusion.processor_diffusion import \
+            make_diffusion_pre_post_processors
 
         processors = make_diffusion_pre_post_processors(
             config=policy_cfg,
@@ -302,7 +309,8 @@ def make_pre_post_processors(
         )
 
     elif isinstance(policy_cfg, ACTConfig):
-        from lerobot.policies.act.processor_act import make_act_pre_post_processors
+        from lerobot.policies.act.processor_act import \
+            make_act_pre_post_processors
 
         processors = make_act_pre_post_processors(
             config=policy_cfg,
@@ -310,7 +318,8 @@ def make_pre_post_processors(
         )
 
     elif isinstance(policy_cfg, VQBeTConfig):
-        from lerobot.policies.vqbet.processor_vqbet import make_vqbet_pre_post_processors
+        from lerobot.policies.vqbet.processor_vqbet import \
+            make_vqbet_pre_post_processors
 
         processors = make_vqbet_pre_post_processors(
             config=policy_cfg,
@@ -318,7 +327,8 @@ def make_pre_post_processors(
         )
 
     elif isinstance(policy_cfg, PI0Config):
-        from lerobot.policies.pi0.processor_pi0 import make_pi0_pre_post_processors
+        from lerobot.policies.pi0.processor_pi0 import \
+            make_pi0_pre_post_processors
 
         processors = make_pi0_pre_post_processors(
             config=policy_cfg,
@@ -326,7 +336,8 @@ def make_pre_post_processors(
         )
 
     elif isinstance(policy_cfg, PI05Config):
-        from lerobot.policies.pi05.processor_pi05 import make_pi05_pre_post_processors
+        from lerobot.policies.pi05.processor_pi05 import \
+            make_pi05_pre_post_processors
 
         processors = make_pi05_pre_post_processors(
             config=policy_cfg,
@@ -334,7 +345,8 @@ def make_pre_post_processors(
         )
 
     elif isinstance(policy_cfg, SACConfig):
-        from lerobot.policies.sac.processor_sac import make_sac_pre_post_processors
+        from lerobot.policies.sac.processor_sac import \
+            make_sac_pre_post_processors
 
         processors = make_sac_pre_post_processors(
             config=policy_cfg,
@@ -342,7 +354,8 @@ def make_pre_post_processors(
         )
 
     elif isinstance(policy_cfg, RewardClassifierConfig):
-        from lerobot.policies.sac.reward_model.processor_classifier import make_classifier_processor
+        from lerobot.policies.sac.reward_model.processor_classifier import \
+            make_classifier_processor
 
         processors = make_classifier_processor(
             config=policy_cfg,
@@ -350,7 +363,8 @@ def make_pre_post_processors(
         )
 
     elif isinstance(policy_cfg, SmolVLAConfig):
-        from lerobot.policies.smolvla.processor_smolvla import make_smolvla_pre_post_processors
+        from lerobot.policies.smolvla.processor_smolvla import \
+            make_smolvla_pre_post_processors
 
         processors = make_smolvla_pre_post_processors(
             config=policy_cfg,
@@ -358,7 +372,8 @@ def make_pre_post_processors(
         )
 
     elif isinstance(policy_cfg, SARMConfig):
-        from lerobot.policies.sarm.processor_sarm import make_sarm_pre_post_processors
+        from lerobot.policies.sarm.processor_sarm import \
+            make_sarm_pre_post_processors
 
         processors = make_sarm_pre_post_processors(
             config=policy_cfg,
@@ -366,7 +381,8 @@ def make_pre_post_processors(
             dataset_meta=kwargs.get("dataset_meta"),
         )
     elif isinstance(policy_cfg, GrootConfig):
-        from lerobot.policies.groot.processor_groot import make_groot_pre_post_processors
+        from lerobot.policies.groot.processor_groot import \
+            make_groot_pre_post_processors
 
         processors = make_groot_pre_post_processors(
             config=policy_cfg,
@@ -374,9 +390,8 @@ def make_pre_post_processors(
         )
 
     elif isinstance(policy_cfg, XVLAConfig):
-        from lerobot.policies.xvla.processor_xvla import (
-            make_xvla_pre_post_processors,
-        )
+        from lerobot.policies.xvla.processor_xvla import \
+            make_xvla_pre_post_processors
 
         processors = make_xvla_pre_post_processors(
             config=policy_cfg,
@@ -384,9 +399,19 @@ def make_pre_post_processors(
         )
 
     elif isinstance(policy_cfg, WallXConfig):
-        from lerobot.policies.wall_x.processor_wall_x import make_wall_x_pre_post_processors
+        from lerobot.policies.wall_x.processor_wall_x import \
+            make_wall_x_pre_post_processors
 
         processors = make_wall_x_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, MoTConfig):
+        from lerobot.policies.mot.processor_mot import \
+            make_mot_pre_post_processors
+
+        processors = make_mot_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
