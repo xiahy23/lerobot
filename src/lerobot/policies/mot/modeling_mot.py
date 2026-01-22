@@ -1,19 +1,3 @@
-#!/usr/bin/env python
-
-# Copyright 2025 The HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """
 MoT (Mixture of Transformers) Model Implementation.
 
@@ -51,9 +35,11 @@ from typing_extensions import Unpack
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.mot.configuration_mot import (AttentionType,
                                                     BackboneType, DecodingMode,
+                                                    EmbedType,
                                                     MoTBackboneConfig,
                                                     MoTConfig, MoTFlowConfig,
-                                                    MoTNodeConfig, NodeType)
+                                                    MoTNodeConfig,
+                                                    NodeInputConfig, NodeType)
 from lerobot.policies.pretrained import PreTrainedPolicy, T
 from lerobot.utils.constants import (ACTION, OBS_LANGUAGE_ATTENTION_MASK,
                                      OBS_LANGUAGE_TOKENS, OBS_STATE,
@@ -434,7 +420,544 @@ class MoTOutputHead(nn.Module):
         return self.head(x)
 
 
-class MoTBackboneWrapper(nn.Module):
+# ==================== Generalized Node Input Embedder ====================
+
+class NodeInputEmbedder(nn.Module):
+    """
+    Generalized input embedder for any node type.
+
+    This provides a configurable per-node embedding system where each node
+    defines its own embedding logic through NodeInputConfig.
+
+    Supported embed types:
+    - VISION: Image embedding via vision encoder
+    - LANGUAGE: Language token embedding
+    - STATE: Linear projection of state vector
+    - ACTION: Action embedding with optional time fusion for flow matching
+    - FLOW_TIME: Standalone timestep embedding
+    - CUSTOM: User-defined embedding function
+    """
+
+    def __init__(
+        self,
+        node_config: MoTNodeConfig,
+        backbone: "MoTBackboneWrapper",
+        config: MoTConfig,
+    ):
+        super().__init__()
+        self.node_config = node_config
+        self.backbone = backbone
+        self.config = config
+        self.input_config = node_config.input_config or NodeInputConfig()
+        self.hidden_size = backbone.hidden_size
+
+        self._init_embedders()
+
+    def _init_embedders(self):
+        """Initialize embedding components based on input config."""
+        embed_type = self.input_config.embed_type
+
+        if embed_type == EmbedType.VISION:
+            # Vision embedding uses backbone's vision encoder
+            # No additional components needed
+            pass
+
+        elif embed_type == EmbedType.LANGUAGE:
+            # Language token embedding uses backbone's token embedder
+            # Scale factor stored
+            self.vocab_scale = self.input_config.vocab_scale
+
+        elif embed_type == EmbedType.STATE:
+            # Linear projection for state
+            state_dim = self.input_config.state_dim or self.config.max_state_dim
+            self.state_proj = nn.Linear(state_dim, self.hidden_size)
+
+        elif embed_type == EmbedType.ACTION:
+            # Action embedding with optional time fusion for flow matching
+            action_dim = self.input_config.action_dim or self.config.max_action_dim
+
+            # Action projection
+            self.action_proj = nn.Linear(action_dim, self.hidden_size)
+
+            if self.input_config.use_time_embedding:
+                # Time-conditioned MLP fusion
+                if self.input_config.use_mlp_fusion:
+                    self.action_time_mlp_in = nn.Linear(2 * self.hidden_size, self.hidden_size)
+                    self.action_time_mlp_out = nn.Linear(self.hidden_size, self.hidden_size)
+                # Otherwise use simple addition (no extra layers needed)
+
+        elif embed_type == EmbedType.FLOW_TIME:
+            # Flow matching timestep embedding
+            # Uses sinusoidal encoding, no learnable parameters needed
+            pass
+
+        elif embed_type == EmbedType.CUSTOM:
+            # Custom embedding - no default initialization
+            pass
+
+    def forward(
+        self,
+        batch: dict[str, Tensor],
+        time: Tensor | None = None,
+        noisy_actions: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """
+        Embed inputs for this node.
+
+        Args:
+            batch: Input batch dictionary
+            time: Time tensor for flow matching (optional)
+            noisy_actions: Noisy action tensor for flow matching (optional)
+
+        Returns:
+            Tuple of (embeddings, pad_mask, att_mask)
+        """
+        embed_type = self.input_config.embed_type
+
+        if embed_type == EmbedType.VISION:
+            return self._embed_vision(batch)
+        elif embed_type == EmbedType.LANGUAGE:
+            return self._embed_tokens(batch)
+        elif embed_type == EmbedType.STATE:
+            return self._embed_state(batch)
+        elif embed_type == EmbedType.ACTION:
+            return self._embed_action_flow(batch, time, noisy_actions)
+        elif embed_type == EmbedType.FLOW_TIME:
+            return self._embed_flow_time(batch, time)
+        else:
+            raise ValueError(f"Unsupported embed type: {embed_type}")
+
+    # ========== Public API methods for embed_all_nodes ==========
+
+    def embed_vision(
+        self,
+        images: list[Tensor],
+        img_masks: list[Tensor],
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """
+        Embed vision inputs (images).
+
+        This is the public API used by embed_all_nodes for VISION embed type.
+
+        Args:
+            images: List of image tensors
+            img_masks: List of image mask tensors (indicating valid images)
+
+        Returns:
+            Tuple of (embeddings, pad_mask, att_mask)
+        """
+        embs = []
+        pad_masks = []
+        att_masks = []
+
+        device = next(self.backbone.parameters()).device
+
+        for img, img_mask in zip(images, img_masks, strict=True):
+            img_emb = self.backbone.embed_image(img)
+            batch_size, num_img_embs = img_emb.shape[:2]
+
+            embs.append(img_emb)
+            pad_masks.append(img_mask[:, None].expand(batch_size, num_img_embs))
+            att_masks.extend([0] * num_img_embs)
+
+        if not embs:
+            raise ValueError(f"No images provided for vision node {self.node_config.name}")
+
+        embs = torch.cat(embs, dim=1)
+        pad_masks = torch.cat(pad_masks, dim=1)
+
+        batch_size = pad_masks.shape[0]
+        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=device)
+        att_masks = att_masks[None, :].expand(batch_size, -1)
+
+        return embs, pad_masks, att_masks
+
+    def embed_language(
+        self,
+        tokens: Tensor,
+        masks: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """
+        Embed language tokens.
+
+        This is the public API used by embed_all_nodes for LANGUAGE embed type.
+
+        Args:
+            tokens: Token IDs tensor
+            masks: Attention mask tensor
+
+        Returns:
+            Tuple of (embeddings, pad_mask, att_mask)
+        """
+        device = tokens.device
+
+        lang_emb = self.backbone.embed_tokens(tokens)
+        lang_emb_dim = lang_emb.shape[-1]
+        lang_emb = lang_emb * math.sqrt(lang_emb_dim)
+
+        batch_size, seq_len = lang_emb.shape[:2]
+
+        # Attention pattern: bidirectional for language
+        att_masks = torch.zeros(batch_size, seq_len, device=device)
+
+        return lang_emb, masks, att_masks
+
+    def embed_state(
+        self,
+        state: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """
+        Embed state vector.
+
+        This is the public API used by embed_all_nodes for STATE embed type.
+
+        Args:
+            state: State tensor
+
+        Returns:
+            Tuple of (embeddings, pad_mask, att_mask)
+        """
+        device = state.device
+        batch_size = state.shape[0]
+
+        # Pad state if needed
+        state = pad_vector(state, self.config.max_state_dim)
+
+        if hasattr(self, 'state_proj') and self.state_proj.weight.dtype == torch.float32:
+            state = state.to(torch.float32)
+
+        state_emb = self.state_proj(state)
+        state_emb = state_emb[:, None, :]  # Add sequence dimension
+
+        pad_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=device)
+        att_mask = torch.ones(batch_size, 1, device=device)  # State is start of causal chain
+
+        return state_emb, pad_mask, att_mask
+
+    def embed_action(
+        self,
+        actions: Tensor,
+        timestep: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """
+        Embed action tokens with optional time conditioning.
+
+        This is the public API used by embed_all_nodes for ACTION embed type.
+        Creates action embeddings with time fusion for flow matching.
+
+        Args:
+            actions: Action tensor (batch, chunk_size, action_dim)
+            timestep: Optional timestep tensor for time conditioning
+
+        Returns:
+            Tuple of (embeddings, pad_mask, att_mask)
+        """
+        device = actions.device
+        batch_size = actions.shape[0]
+
+        # Action projection
+        action_emb = self.action_proj(actions)
+
+        if timestep is not None and self.input_config.use_time_embedding:
+            # Time embedding
+            time_emb = create_sinusoidal_pos_embedding(
+                timestep,
+                self.hidden_size,
+                min_period=self.config.min_period,
+                max_period=self.config.max_period,
+                device=device,
+            )
+            time_emb = time_emb.to(dtype=timestep.dtype)
+            time_emb_expanded = time_emb[:, None, :].expand_as(action_emb)
+
+            if self.input_config.use_mlp_fusion:
+                action_time_emb = torch.cat([action_emb, time_emb_expanded], dim=2)
+                x = self.action_time_mlp_in(action_time_emb)
+                x = F.silu(x)
+                action_emb = self.action_time_mlp_out(x)
+            else:
+                action_emb = action_emb + time_emb_expanded
+
+        seq_len = action_emb.shape[1]
+        pad_mask = torch.ones(batch_size, seq_len, dtype=torch.bool, device=device)
+
+        # Causal attention for action tokens
+        att_mask = torch.zeros(batch_size, seq_len, device=device)
+
+        return action_emb, pad_mask, att_mask
+
+    def embed_flow_time(
+        self,
+        timestep: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """
+        Embed flow matching timestep as a standalone token.
+
+        This is the public API used by embed_all_nodes for FLOW_TIME embed type.
+
+        Args:
+            timestep: Timestep tensor
+
+        Returns:
+            Tuple of (embeddings, pad_mask, att_mask)
+        """
+        device = timestep.device
+        batch_size = timestep.shape[0]
+
+        time_emb = create_sinusoidal_pos_embedding(
+            timestep,
+            self.hidden_size,
+            min_period=self.config.min_period,
+            max_period=self.config.max_period,
+            device=device,
+        )
+        time_emb = time_emb.to(dtype=timestep.dtype)
+        time_emb = time_emb[:, None, :]  # Add sequence dimension
+
+        pad_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=device)
+        att_mask = torch.zeros(batch_size, 1, device=device)
+
+        return time_emb, pad_mask, att_mask
+
+    def _embed_vision(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
+        """Embed vision inputs (images + optional language)."""
+        embs = []
+        pad_masks = []
+        att_masks = []
+
+        device = next(self.backbone.parameters()).device
+
+        # Process images
+        image_keys = self.input_config.image_keys or list(self.config.image_features.keys())
+
+        for key in image_keys:
+            if key not in batch:
+                continue
+            img = batch[key]
+            img_emb = self.backbone.embed_image(img)
+            batch_size, num_img_embs = img_emb.shape[:2]
+
+            embs.append(img_emb)
+            # Create image mask (all valid)
+            mask = torch.ones(batch_size, num_img_embs, dtype=torch.bool, device=device)
+            pad_masks.append(mask)
+            # Bidirectional attention for images
+            att_masks.extend([0] * num_img_embs)
+
+        # Process language tokens if present
+        if OBS_LANGUAGE_TOKENS in batch:
+            lang_tokens = batch[OBS_LANGUAGE_TOKENS]
+            lang_masks = batch.get(OBS_LANGUAGE_ATTENTION_MASK)
+
+            lang_emb = self.backbone.embed_tokens(lang_tokens)
+            lang_emb_dim = lang_emb.shape[-1]
+            lang_emb = lang_emb * math.sqrt(lang_emb_dim) * self.input_config.vocab_scale
+
+            embs.append(lang_emb)
+            if lang_masks is not None:
+                pad_masks.append(lang_masks)
+            else:
+                pad_masks.append(torch.ones(lang_emb.shape[:2], dtype=torch.bool, device=device))
+
+            num_lang_embs = lang_emb.shape[1]
+            att_masks.extend([0] * num_lang_embs)
+
+        if not embs:
+            raise ValueError(f"No valid inputs found for vision node {self.node_config.name}")
+
+        embs = torch.cat(embs, dim=1)
+        pad_masks = torch.cat(pad_masks, dim=1)
+
+        batch_size = pad_masks.shape[0]
+        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=device)
+        att_masks = att_masks[None, :].expand(batch_size, -1)
+
+        return embs, pad_masks, att_masks
+
+    def _embed_tokens(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
+        """Embed language tokens."""
+        lang_tokens = batch[OBS_LANGUAGE_TOKENS]
+        lang_masks = batch.get(OBS_LANGUAGE_ATTENTION_MASK)
+        device = lang_tokens.device
+
+        lang_emb = self.backbone.embed_tokens(lang_tokens)
+        lang_emb_dim = lang_emb.shape[-1]
+        lang_emb = lang_emb * math.sqrt(lang_emb_dim) * self.input_config.vocab_scale
+
+        batch_size, seq_len = lang_emb.shape[:2]
+
+        if lang_masks is None:
+            lang_masks = torch.ones(batch_size, seq_len, dtype=torch.bool, device=device)
+
+        # Attention pattern
+        if self.input_config.attention_pattern == "causal":
+            att_masks = torch.ones(batch_size, seq_len, device=device)
+        else:
+            att_masks = torch.zeros(batch_size, seq_len, device=device)
+
+        return lang_emb, lang_masks, att_masks
+
+    def _embed_state(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
+        """Embed state vector."""
+        state = batch[OBS_STATE]
+        device = state.device
+        batch_size = state.shape[0]
+
+        # Pad state if needed
+        state = pad_vector(state, self.config.max_state_dim)
+
+        if self.state_proj.weight.dtype == torch.float32:
+            state = state.to(torch.float32)
+
+        state_emb = self.state_proj(state)
+        state_emb = state_emb[:, None, :]  # Add sequence dimension
+
+        pad_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=device)
+        att_mask = torch.zeros(batch_size, 1, device=device)
+
+        return state_emb, pad_mask, att_mask
+
+    def _embed_action_flow(
+        self,
+        batch: dict[str, Tensor],
+        time: Tensor | None,
+        noisy_actions: Tensor | None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """
+        Embed action + time for flow matching (used by action expert nodes).
+
+        NOTE: This is the internal method for batch-based API.
+        For the public API, use embed_action().
+
+        This creates: [action_token_1, action_token_2, ..., action_token_n]
+        (State should be handled by a separate STATE node if needed)
+        """
+        if time is None or noisy_actions is None:
+            raise ValueError("ACTION embed type requires time and noisy_actions")
+
+        device = time.device
+        batch_size = time.shape[0]
+
+        # Time embedding
+        time_emb = create_sinusoidal_pos_embedding(
+            time,
+            self.hidden_size,
+            min_period=self.config.min_period,
+            max_period=self.config.max_period,
+            device=device,
+        )
+        time_emb = time_emb.to(dtype=time.dtype)
+
+        # Action embedding with time fusion
+        action_emb = self.action_proj(noisy_actions)
+        time_emb_expanded = time_emb[:, None, :].expand_as(action_emb)
+
+        if self.input_config.use_mlp_fusion:
+            action_time_emb = torch.cat([action_emb, time_emb_expanded], dim=2)
+            x = self.action_time_mlp_in(action_time_emb)
+            x = F.silu(x)
+            action_time_emb = self.action_time_mlp_out(x)
+        else:
+            action_time_emb = action_emb + time_emb_expanded
+
+        action_seq_len = action_time_emb.shape[1]
+        pad_mask = torch.ones(batch_size, action_seq_len, dtype=torch.bool, device=device)
+
+        # Causal attention for action tokens
+        att_mask = torch.zeros(batch_size, action_seq_len, device=device)
+
+        return action_time_emb, pad_mask, att_mask
+
+    def _embed_flow_time(
+        self,
+        batch: dict[str, Tensor],
+        time: Tensor | None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Embed flow matching timestep as standalone token."""
+        if time is None:
+            raise ValueError("FLOW_TIME embed type requires time tensor")
+
+        return self.embed_flow_time(time)
+
+        return embs, pad_masks, att_masks
+
+    def get_adarms_cond(
+        self,
+        time: Tensor | None = None,
+        batch: dict[str, Tensor] | None = None,
+    ) -> Tensor | None:
+        """Get AdaRMS conditioning tensor if applicable."""
+        # This can be extended based on backbone requirements
+        return None
+
+
+# ==================== Backbone Interface ====================
+
+class BackboneInterface:
+    """
+    Interface that all backbone wrappers must implement.
+
+    This ensures consistent behavior across different transformer types
+    (PaliGemma, Gemma, LLaMA, Qwen, Bagel, etc.).
+    """
+
+    @property
+    def hidden_size(self) -> int:
+        """Return the hidden dimension of this backbone."""
+        raise NotImplementedError
+
+    @property
+    def num_layers(self) -> int:
+        """Return the number of transformer layers."""
+        raise NotImplementedError
+
+    @property
+    def num_heads(self) -> int:
+        """Return the number of attention heads."""
+        raise NotImplementedError
+
+    @property
+    def head_dim(self) -> int:
+        """Return the dimension of each attention head."""
+        raise NotImplementedError
+
+    @property
+    def num_kv_heads(self) -> int:
+        """Return the number of key/value heads (for GQA)."""
+        raise NotImplementedError
+
+    def embed_tokens(self, tokens: Tensor) -> Tensor:
+        """Embed language tokens."""
+        raise NotImplementedError
+
+    def embed_image(self, image: Tensor) -> Tensor:
+        """Embed images (only for VLM backbones)."""
+        raise NotImplementedError
+
+    def get_layer(self, layer_idx: int) -> nn.Module:
+        """Get a specific transformer layer."""
+        raise NotImplementedError
+
+    def get_norm(self) -> nn.Module:
+        """Get the final normalization layer."""
+        raise NotImplementedError
+
+    def get_rotary_emb(self) -> nn.Module | None:
+        """Get the rotary embedding module if available."""
+        raise NotImplementedError
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_path: str,
+        config: MoTBackboneConfig,
+        **kwargs,
+    ) -> "BackboneInterface":
+        """Load pretrained weights."""
+        raise NotImplementedError
+
+
+class MoTBackboneWrapper(nn.Module, BackboneInterface):
     """
     Wraps a HuggingFace transformer backbone for use in MoT.
 
@@ -599,6 +1122,18 @@ class MoTBackboneWrapper(nn.Module):
     def num_layers(self) -> int:
         return self.backbone_config.num_hidden_layers
 
+    @property
+    def num_heads(self) -> int:
+        return self.backbone_config.num_attention_heads
+
+    @property
+    def head_dim(self) -> int:
+        return self.backbone_config.head_dim
+
+    @property
+    def num_kv_heads(self) -> int:
+        return self.backbone_config.num_key_value_heads
+
     def embed_tokens(self, tokens: Tensor) -> Tensor:
         """Embed language tokens."""
         if hasattr(self, 'language_model') and hasattr(self.language_model, 'embed_tokens'):
@@ -616,91 +1151,170 @@ class MoTBackboneWrapper(nn.Module):
             raise ValueError("This backbone does not have a vision encoder")
         return self.vision_encoder(image)
 
-    def forward(
-        self,
-        images: list[Tensor],
-        img_masks: list[Tensor],
-        lang_tokens: Tensor,
-        lang_masks: Tensor,
-        state: Tensor,
-        actions: Tensor,
-        noise: Tensor | None = None,
-        time: Tensor | None = None,
-    ) -> Tensor:
+    def get_layer(self, layer_idx: int) -> nn.Module:
+        """Get a specific transformer layer."""
+        if hasattr(self, 'language_model') and hasattr(self.language_model, 'layers'):
+            return self.language_model.layers[layer_idx]
+        elif hasattr(self, 'model') and hasattr(self.model, 'layers'):
+            return self.model.layers[layer_idx]
+        else:
+            raise ValueError("Cannot find layers in backbone")
+
+    def get_norm(self) -> nn.Module:
+        """Get the final normalization layer."""
+        if hasattr(self, 'language_model') and hasattr(self.language_model, 'norm'):
+            return self.language_model.norm
+        elif hasattr(self, 'model') and hasattr(self.model, 'norm'):
+            return self.model.norm
+        else:
+            raise ValueError("Cannot find norm in backbone")
+
+    def get_rotary_emb(self) -> nn.Module | None:
+        """Get the rotary embedding module if available."""
+        if hasattr(self, 'language_model') and hasattr(self.language_model, 'rotary_emb'):
+            return self.language_model.rotary_emb
+        elif hasattr(self, 'model') and hasattr(self.model, 'language_model'):
+            lm = self.model.language_model
+            if hasattr(lm, 'rotary_emb'):
+                return lm.rotary_emb
+        return None
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_path: str,
+        backbone_config: MoTBackboneConfig,
+        **kwargs,
+    ) -> "MoTBackboneWrapper":
         """
-        Full training forward pass with flow matching loss.
+        Load a backbone from pretrained weights.
+
+        Args:
+            pretrained_path: Path to pretrained weights (local or HuggingFace hub)
+            backbone_config: Configuration for the backbone
+            **kwargs: Additional arguments for loading
+
+        Returns:
+            Initialized backbone wrapper with loaded weights
         """
-        if noise is None:
-            noise = self.sample_noise(actions.shape, actions.device)
-        if time is None:
-            time = self.sample_time(actions.shape[0], actions.device)
+        # Create wrapper with config
+        wrapper = cls(backbone_config)
 
-        # Flow matching interpolation
-        time_expanded = time[:, None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
+        # Load weights based on backbone type
+        if backbone_config.backbone_type == BackboneType.PALIGEMMA:
+            wrapper._load_paligemma_weights(pretrained_path, **kwargs)
+        elif backbone_config.backbone_type == BackboneType.GEMMA:
+            wrapper._load_gemma_weights(pretrained_path, **kwargs)
+        elif backbone_config.backbone_type == BackboneType.LLAMA:
+            wrapper._load_llama_weights(pretrained_path, **kwargs)
+        elif backbone_config.backbone_type == BackboneType.QWEN:
+            wrapper._load_qwen_weights(pretrained_path, **kwargs)
+        else:
+            logger.warning(f"No pretrained loading implemented for {backbone_config.backbone_type}")
 
-        # Embed inputs
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks
-        )
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
-            state, x_t, time
-        )
+        return wrapper
 
-        # Convert to appropriate dtype (Optional check, kept from your code)
-        vlm_backbone = list(self.backbones.values())[0]
-        if hasattr(vlm_backbone, 'language_model') and vlm_backbone.language_model.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
-            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
-            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
+    def _load_paligemma_weights(self, pretrained_path: str, **kwargs):
+        """Load PaliGemma pretrained weights."""
+        from transformers import \
+            PaliGemmaForConditionalGeneration as HFPaliGemma
 
-        # Create token blocks
-        token_blocks = [
-            TokenBlock(
-                node_name="vlm",
-                embeddings=prefix_embs,
-                pad_mask=prefix_pad_masks,
-                att_mask=prefix_att_masks,
-            ),
-            TokenBlock(
-                node_name="action_expert",
-                embeddings=suffix_embs,
-                pad_mask=suffix_pad_masks,
-                att_mask=suffix_att_masks,
-            ),
-        ]
+        try:
+            pretrained_model = HFPaliGemma.from_pretrained(
+                pretrained_path,
+                torch_dtype=torch.float32 if self.backbone_config.dtype == "float32" else torch.bfloat16,
+                **kwargs,
+            )
 
-        # 准备 AdaRMS 条件（如果存在）
-        # 需要映射到 backbone name
-        adarms_conds = {}
-        if adarms_cond is not None and "action_expert" in self.node_to_backbone:
-            expert_backbone_name = self.node_to_backbone["action_expert"]
-            adarms_conds[expert_backbone_name] = adarms_cond
+            # Copy weights
+            missing, unexpected = self.model.load_state_dict(
+                pretrained_model.state_dict(), strict=False
+            )
 
-        # 调用异构联合注意力
-        output_blocks, _ = self.joint_attention(
-            token_blocks,
-            use_cache=False,
-            adarms_conds=adarms_conds
-        )
+            if missing:
+                logger.warning(f"Missing keys when loading PaliGemma weights: {missing[:10]}...")
+            if unexpected:
+                logger.warning(f"Unexpected keys when loading PaliGemma weights: {unexpected[:10]}...")
 
-        # 提取 Action 输出 (找到 action_expert 对应的块)
-        suffix_out = None
-        for block in output_blocks:
-            if block.node_name == "action_expert":
-                suffix_out = block.embeddings
-                break
+            del pretrained_model
 
-        if suffix_out is None:
-            raise ValueError("Action expert output not found!")
+        except Exception as e:
+            logger.error(f"Failed to load PaliGemma weights from {pretrained_path}: {e}")
+            raise
 
-        # 截取最后 chunk_size 个 token
-        suffix_out = suffix_out[:, -self.config.chunk_size:]
-        suffix_out = suffix_out.to(dtype=torch.float32)
+    def _load_gemma_weights(self, pretrained_path: str, **kwargs):
+        """Load Gemma pretrained weights."""
+        from transformers import GemmaForCausalLM as HFGemma
 
-        v_t = self.action_out_proj(suffix_out)
+        try:
+            pretrained_model = HFGemma.from_pretrained(
+                pretrained_path,
+                torch_dtype=torch.float32 if self.backbone_config.dtype == "float32" else torch.bfloat16,
+                **kwargs,
+            )
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+            missing, unexpected = self.model.load_state_dict(
+                pretrained_model.state_dict(), strict=False
+            )
+
+            if missing:
+                logger.warning(f"Missing keys when loading Gemma weights: {missing[:10]}...")
+            if unexpected:
+                logger.warning(f"Unexpected keys when loading Gemma weights: {unexpected[:10]}...")
+
+            del pretrained_model
+
+        except Exception as e:
+            logger.error(f"Failed to load Gemma weights from {pretrained_path}: {e}")
+            raise
+
+    def _load_llama_weights(self, pretrained_path: str, **kwargs):
+        """Load LLaMA pretrained weights."""
+        try:
+            from transformers import LlamaForCausalLM as HFLlama
+
+            pretrained_model = HFLlama.from_pretrained(
+                pretrained_path,
+                torch_dtype=torch.float32 if self.backbone_config.dtype == "float32" else torch.bfloat16,
+                **kwargs,
+            )
+
+            missing, unexpected = self.model.load_state_dict(
+                pretrained_model.state_dict(), strict=False
+            )
+
+            if missing:
+                logger.warning(f"Missing keys when loading LLaMA weights: {missing[:10]}...")
+
+            del pretrained_model
+
+        except Exception as e:
+            logger.error(f"Failed to load LLaMA weights from {pretrained_path}: {e}")
+            raise
+
+    def _load_qwen_weights(self, pretrained_path: str, **kwargs):
+        """Load Qwen pretrained weights."""
+        try:
+            from transformers import Qwen2ForCausalLM as HFQwen
+
+            pretrained_model = HFQwen.from_pretrained(
+                pretrained_path,
+                torch_dtype=torch.float32 if self.backbone_config.dtype == "float32" else torch.bfloat16,
+                **kwargs,
+            )
+
+            missing, unexpected = self.model.load_state_dict(
+                pretrained_model.state_dict(), strict=False
+            )
+
+            if missing:
+                logger.warning(f"Missing keys when loading Qwen weights: {missing[:10]}...")
+
+            del pretrained_model
+
+        except Exception as e:
+            logger.error(f"Failed to load Qwen weights from {pretrained_path}: {e}")
+            raise
 
 
 class MoTJointLayerAttention(nn.Module):
@@ -782,49 +1396,46 @@ class MoTJointLayerAttention(nn.Module):
         # Get rotary embeddings from first backbone (they're shared since head_dim is same)
         self._rotary_emb = None
 
+        # Initialize KV cache structure
+        self._kv_cache: dict[str, list[tuple[Tensor, Tensor]]] | None = None
+
     def _get_rotary_emb(self):
         """Get the rotary embedding module from any backbone."""
         if self._rotary_emb is None:
             for backbone in self.backbones.values():
-                if hasattr(backbone, 'language_model') and hasattr(backbone.language_model, 'rotary_emb'):
-                    self._rotary_emb = backbone.language_model.rotary_emb
-                    break
-                elif hasattr(backbone, 'model') and hasattr(backbone.model, 'language_model'):
-                    self._rotary_emb = backbone.model.language_model.rotary_emb
+                rotary = backbone.get_rotary_emb()
+                if rotary is not None:
+                    self._rotary_emb = rotary
                     break
         return self._rotary_emb
 
-    def _get_layer(self, backbone: MoTBackboneWrapper, layer_idx: int) -> nn.Module:
-        """Get a specific layer from a backbone."""
-        if hasattr(backbone, 'language_model') and hasattr(backbone.language_model, 'layers'):
-            return backbone.language_model.layers[layer_idx]
-        elif hasattr(backbone, 'model') and hasattr(backbone.model, 'layers'):
-            return backbone.model.layers[layer_idx]
-        else:
-            raise ValueError(f"Cannot find layers in backbone")
-
-    def _get_norm(self, backbone: MoTBackboneWrapper) -> nn.Module:
-        """Get the final norm layer from a backbone."""
-        if hasattr(backbone, 'language_model') and hasattr(backbone.language_model, 'norm'):
-            return backbone.language_model.norm
-        elif hasattr(backbone, 'model') and hasattr(backbone.model, 'norm'):
-            return backbone.model.norm
-        else:
-            raise ValueError(f"Cannot find norm in backbone")
+    def reset_kv_cache(self):
+        """Reset the KV cache."""
+        self._kv_cache = None
 
     def forward(
         self,
         token_blocks: list[TokenBlock],
-        past_key_values: dict[str, Any] | None = None,
+        past_key_values: dict[str, list[tuple[Tensor, Tensor]]] | None = None,
         use_cache: bool = False,
         adarms_conds: dict[str, Tensor] | None = None,
-    ) -> tuple[list[TokenBlock], dict[str, Any] | None]:
+    ) -> tuple[list[TokenBlock], dict[str, list[tuple[Tensor, Tensor]]] | None]:
         """
         Forward pass through heterogeneous joint-layer attention.
 
         This processes all token blocks through their respective backbones
         while allowing attention between blocks according to flow config,
         even when backbones have different hidden sizes.
+
+        Args:
+            token_blocks: List of TokenBlock, one per input node
+            past_key_values: Dict of cached K/V per backbone, each is a list
+                             of (key, value) tuples per layer
+            use_cache: Whether to return new_past_key_values for caching
+            adarms_conds: Dict of AdaRMS conditioning tensors per backbone
+
+        Returns:
+            Tuple of (output_blocks, new_past_key_values)
         """
         if adarms_conds is None:
             adarms_conds = {}
@@ -844,7 +1455,19 @@ class MoTJointLayerAttention(nn.Module):
 
         # Build position IDs for RoPE
         combined_pad_mask = torch.cat([b.pad_mask for b in token_blocks], dim=1)
-        position_ids = torch.cumsum(combined_pad_mask.long(), dim=1) - 1
+
+        # Adjust position IDs for incremental decoding (when using cache)
+        if past_key_values is not None:
+            # Get cache sequence length from first backbone's first layer
+            cache_seq_len = 0
+            for backbone_name in self.backbone_order:
+                if backbone_name in past_key_values and len(past_key_values[backbone_name]) > 0:
+                    cache_seq_len = past_key_values[backbone_name][0][0].shape[2]
+                    break
+            # Start position IDs from cache_seq_len
+            position_ids = torch.cumsum(combined_pad_mask.long(), dim=1) - 1 + cache_seq_len
+        else:
+            position_ids = torch.cumsum(combined_pad_mask.long(), dim=1) - 1
 
         # Get rotary embeddings
         rotary_emb = self._get_rotary_emb()
@@ -858,22 +1481,41 @@ class MoTJointLayerAttention(nn.Module):
             ]
 
         # Process through layers
-        new_past_key_values = {} if use_cache else None
+        new_past_key_values: dict[str, list[tuple[Tensor, Tensor]]] | None = None
+        if use_cache:
+            new_past_key_values = {name: [] for name in self.backbone_order}
 
         for layer_idx in range(self.num_layers):
-            hidden_states_per_backbone = self._process_layer_heterogeneous(
+            # Get past KV for this layer (if any)
+            layer_past_kv = None
+            if past_key_values is not None:
+                layer_past_kv = {}
+                for backbone_name in self.backbone_order:
+                    if backbone_name in past_key_values and layer_idx < len(past_key_values[backbone_name]):
+                        layer_past_kv[backbone_name] = past_key_values[backbone_name][layer_idx]
+                    else:
+                        layer_past_kv[backbone_name] = None
+
+            hidden_states_per_backbone, layer_new_kv = self._process_layer_heterogeneous(
                 layer_idx=layer_idx,
                 hidden_states_per_backbone=hidden_states_per_backbone,
                 attention_mask_4d=attention_mask_4d,
                 position_ids=position_ids,
                 adarms_conds=adarms_conds,
                 rotary_emb=rotary_emb,
+                past_key_values=layer_past_kv,
+                use_cache=use_cache,
             )
+
+            # Store new KV cache for this layer
+            if use_cache and layer_new_kv is not None:
+                for backbone_name, kv in layer_new_kv.items():
+                    new_past_key_values[backbone_name].append(kv)
 
         # Apply final normalization per backbone
         for backbone_name, indexed_hidden_states in hidden_states_per_backbone.items():
             backbone = self.backbones[backbone_name]
-            norm = self._get_norm(backbone)
+            norm = backbone.get_norm()
             adarms_cond = adarms_conds.get(backbone_name)
 
             new_indexed_hidden_states = []
@@ -915,7 +1557,9 @@ class MoTJointLayerAttention(nn.Module):
         position_ids: Tensor,
         adarms_conds: dict[str, Tensor],
         rotary_emb: nn.Module | None,
-    ) -> dict[str, list[tuple[int, Tensor]]]:
+        past_key_values: dict[str, tuple[Tensor, Tensor]] | None = None,
+        use_cache: bool = False,
+    ) -> tuple[dict[str, list[tuple[int, Tensor]]], dict[str, tuple[Tensor, Tensor]] | None]:
         """
         Process a single layer with heterogeneous hidden sizes using explicit
         joint attention in head space.
@@ -924,6 +1568,19 @@ class MoTJointLayerAttention(nn.Module):
         Phase 2: Global attention in head_space with RoPE
         Phase 3: Output projection back to disparate hidden_size
         Phase 4: Independent FFN per backbone
+
+        Args:
+            layer_idx: Current layer index
+            hidden_states_per_backbone: Dict mapping backbone name to list of (idx, tensor)
+            attention_mask_4d: Attention mask [B, 1, seq, seq]
+            position_ids: Position IDs for RoPE
+            adarms_conds: AdaRMS conditioning per backbone
+            rotary_emb: Rotary position embedding module
+            past_key_values: Dict mapping backbone name to (past_key, past_value) for this layer
+            use_cache: Whether to return updated KV cache
+
+        Returns:
+            Tuple of (updated hidden_states_per_backbone, new_kv_cache_for_this_layer)
         """
         batch_size = attention_mask_4d.shape[0]
         device = attention_mask_4d.device
@@ -942,13 +1599,16 @@ class MoTJointLayerAttention(nn.Module):
         # Track sequence positions for slicing attention output
         seq_start = 0
 
+        # KV cache storage for this layer
+        new_kv_cache: dict[str, tuple[Tensor, Tensor]] | None = {} if use_cache else None
+
         for backbone_name in self.backbone_order:
             indexed_hidden_states = hidden_states_per_backbone.get(backbone_name, [])
             if not indexed_hidden_states:
                 continue
 
             backbone = self.backbones[backbone_name]
-            layer = self._get_layer(backbone, layer_idx)
+            layer = backbone.get_layer(layer_idx)
             adarms_cond = adarms_conds.get(backbone_name)
 
             # Concatenate this backbone's hidden states
@@ -988,6 +1648,19 @@ class MoTJointLayerAttention(nn.Module):
             v = layer.self_attn.v_proj(normed)
             v = v.view(*input_shape, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
+            # Handle KV cache for this backbone
+            if past_key_values is not None and backbone_name in past_key_values:
+                past_kv = past_key_values[backbone_name]
+                if past_kv is not None:
+                    past_k, past_v = past_kv
+                    # Concatenate past K/V with current K/V
+                    k = torch.cat([past_k, k], dim=2)
+                    v = torch.cat([past_v, v], dim=2)
+
+            # Store new KV for cache (include full K/V including past)
+            if use_cache:
+                new_kv_cache[backbone_name] = (k.clone(), v.clone())
+
             # Store for concatenation
             all_query_states.append(q)
             all_key_states.append(k)
@@ -1013,6 +1686,7 @@ class MoTJointLayerAttention(nn.Module):
         # =================================================================
         # Phase 2: Global Attention in Head Space
         # Concatenate Q, K, V along sequence dimension and compute attention
+        # Note: When using cache, K/V are already extended with past values
         # =================================================================
 
         # Concatenate: [B, num_heads, total_seq, head_dim]
@@ -1037,7 +1711,7 @@ class MoTJointLayerAttention(nn.Module):
 
         # Get scaling factor from first layer
         first_backbone = self.backbones[self.backbone_order[0]]
-        first_layer = self._get_layer(first_backbone, layer_idx)
+        first_layer = first_backbone.get_layer(layer_idx)
         scaling = first_layer.self_attn.scaling
 
         # Compute attention using eager_attention_forward
@@ -1133,7 +1807,7 @@ class MoTJointLayerAttention(nn.Module):
 
             output_hidden_states_per_backbone[backbone_name] = output_indexed_hidden_states
 
-        return output_hidden_states_per_backbone
+        return output_hidden_states_per_backbone, new_kv_cache
 
 
 class MoTModel(nn.Module):
@@ -1142,19 +1816,30 @@ class MoTModel(nn.Module):
 
     This is the main model class that:
     - Creates and manages multiple transformer backbones
-    - Routes inputs through the appropriate projections
+    - Routes inputs through the appropriate projections via NodeInputEmbedder
     - Performs joint-layer attention
     - Produces outputs through the appropriate heads
+
+    The key abstraction is that each node has its own NodeInputEmbedder that
+    defines how to embed its inputs into TokenBlocks for joint attention.
     """
 
     def __init__(self, config: MoTConfig):
         super().__init__()
         self.config = config
 
-        # Initialize backbones
+        # Initialize backbones (with optional pretrained weights)
         self.backbones: dict[str, MoTBackboneWrapper] = nn.ModuleDict()
         for backbone_cfg in config.backbones:
-            self.backbones[backbone_cfg.name] = MoTBackboneWrapper(backbone_cfg)
+            if backbone_cfg.pretrained_path:
+                # Load from pretrained
+                self.backbones[backbone_cfg.name] = MoTBackboneWrapper.from_pretrained(
+                    backbone_cfg.pretrained_path,
+                    backbone_cfg,
+                )
+            else:
+                # Initialize from scratch
+                self.backbones[backbone_cfg.name] = MoTBackboneWrapper(backbone_cfg)
 
         # Build node-to-backbone mapping
         self.node_to_backbone: dict[str, str] = {}
@@ -1162,13 +1847,13 @@ class MoTModel(nn.Module):
             if node.backbone_name:
                 self.node_to_backbone[node.name] = node.backbone_name
 
-        # Initialize input projections
-        self.input_projections: dict[str, MoTInputProjection] = nn.ModuleDict()
+        # Initialize input embedders per node
+        self.input_embedders: dict[str, NodeInputEmbedder] = nn.ModuleDict()
         for node in config.nodes:
             if node.is_input and node.backbone_name:
                 backbone = self.backbones[node.backbone_name]
-                self.input_projections[node.name] = MoTInputProjection(
-                    node, backbone.hidden_size
+                self.input_embedders[node.name] = NodeInputEmbedder(
+                    node, backbone, config
                 )
 
         # Initialize output heads
@@ -1238,129 +1923,76 @@ class MoTModel(nn.Module):
         time = time_beta * self.config.time_sampling_scale + self.config.time_sampling_offset
         return time.to(dtype=torch.float32, device=device)
 
-    def embed_prefix(
+    def embed_all_nodes(
         self,
-        images: list[Tensor],
-        img_masks: list[Tensor],
-        lang_tokens: Tensor,
-        lang_masks: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+        inputs: dict[str, Any],
+    ) -> list[TokenBlock]:
         """
-        Embed prefix inputs (images + language) for VLM backbone.
+        Embed inputs for all nodes using their configured input embedders.
+
+        Each node's embedding is handled by its NodeInputEmbedder based on
+        the node's input_config.embed_type. Returns a list of TokenBlocks.        Args:
+            inputs: Dictionary containing all input data:
+                - "images": list[Tensor] for vision nodes
+                - "img_masks": list[Tensor] for vision nodes
+                - "lang_tokens": Tensor for language nodes
+                - "lang_masks": Tensor for language nodes
+                - "state": Tensor for state nodes
+                - "noisy_actions": Tensor for action nodes (flow matching)
+                - "timestep": Tensor for action nodes with time fusion
 
         Returns:
-            Tuple of (embeddings, padding_masks, attention_masks)
+            List of TokenBlock, one per configured input node.
         """
-        embs = []
-        pad_masks = []
-        att_masks = []
+        token_blocks = []
 
-        # Find VLM backbone
-        vlm_backbone = None
-        for name, backbone in self.backbones.items():
-            if backbone.backbone_config.backbone_type == BackboneType.PALIGEMMA:
-                vlm_backbone = backbone
-                break
+        for node in self.config.nodes:
+            if not node.is_input or node.name not in self.input_embedders:
+                continue
 
-        if vlm_backbone is None:
-            raise ValueError("No VLM backbone found for prefix embedding")
+            embedder = self.input_embedders[node.name]
+            embed_type = node.input_config.embed_type if node.input_config else EmbedType.CUSTOM
 
-        # Process images
-        for img, img_mask in zip(images, img_masks, strict=True):
-            img_emb = vlm_backbone.embed_image(img)
-            batch_size, num_img_embs = img_emb.shape[:2]
+            # Dispatch to appropriate embedding method based on embed_type
+            if embed_type == EmbedType.VISION:
+                embs, pad_mask, att_mask = embedder.embed_vision(
+                    images=inputs.get("images", []),
+                    img_masks=inputs.get("img_masks", []),
+                )
+            elif embed_type == EmbedType.LANGUAGE:
+                embs, pad_mask, att_mask = embedder.embed_language(
+                    tokens=inputs["lang_tokens"],
+                    masks=inputs["lang_masks"],
+                )
+            elif embed_type == EmbedType.STATE:
+                embs, pad_mask, att_mask = embedder.embed_state(
+                    state=inputs["state"],
+                )
+            elif embed_type == EmbedType.ACTION:
+                embs, pad_mask, att_mask = embedder.embed_action(
+                    actions=inputs.get("noisy_actions", inputs.get("actions")),
+                    timestep=inputs.get("timestep"),
+                )
+            elif embed_type == EmbedType.FLOW_TIME:
+                embs, pad_mask, att_mask = embedder.embed_flow_time(
+                    timestep=inputs["timestep"],
+                )
+            else:
+                # Custom - use the embedder's forward method if defined
+                node_inputs = {
+                    k: inputs[k] for k in node.input_config.input_keys
+                    if k in inputs
+                } if node.input_config else {}
+                embs, pad_mask, att_mask = embedder(node_inputs)
 
-            embs.append(img_emb)
-            pad_masks.append(img_mask[:, None].expand(batch_size, num_img_embs))
-            att_masks.extend([0] * num_img_embs)
+            token_blocks.append(TokenBlock(
+                node_name=node.name,
+                embeddings=embs,
+                pad_mask=pad_mask,
+                att_mask=att_mask,
+            ))
 
-        # Process language
-        lang_emb = vlm_backbone.embed_tokens(lang_tokens)
-        lang_emb_dim = lang_emb.shape[-1]
-        lang_emb = lang_emb * math.sqrt(lang_emb_dim)
-
-        embs.append(lang_emb)
-        pad_masks.append(lang_masks)
-
-        num_lang_embs = lang_emb.shape[1]
-        att_masks.extend([0] * num_lang_embs)
-
-        embs = torch.cat(embs, dim=1)
-        pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
-
-        batch_size = pad_masks.shape[0]
-        att_masks = att_masks[None, :].expand(batch_size, len(att_masks))
-
-        return embs, pad_masks, att_masks
-
-    def embed_suffix(
-        self,
-        state: Tensor,
-        noisy_actions: Tensor,
-        timestep: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
-        """
-        Embed suffix inputs (state + noisy actions + time) for action expert.
-
-        Returns:
-            Tuple of (embeddings, padding_masks, attention_masks, adarms_cond)
-        """
-        embs = []
-        pad_masks = []
-        att_masks = []
-
-        # Ensure correct dtype for state projection
-        if hasattr(self, 'state_proj') and self.state_proj.weight.dtype == torch.float32:
-            state = state.to(torch.float32)
-
-        # State embedding
-        state_emb = self.state_proj(state)
-        embs.append(state_emb[:, None, :])
-
-        batch_size = state_emb.shape[0]
-        device = state_emb.device
-
-        state_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=device)
-        pad_masks.append(state_mask)
-        att_masks.append(1)
-
-        # Time embedding
-        time_emb = create_sinusoidal_pos_embedding(
-            timestep,
-            self.action_in_proj.out_features,
-            min_period=self.config.min_period,
-            max_period=self.config.max_period,
-            device=device,
-        )
-        time_emb = time_emb.type(dtype=timestep.dtype)
-
-        # Action embedding with time fusion
-        action_emb = self.action_in_proj(noisy_actions)
-        time_emb = time_emb[:, None, :].expand_as(action_emb)
-        action_time_emb = torch.cat([action_emb, time_emb], dim=2)
-
-        # MLP fusion
-        x = self.action_time_mlp_in(action_time_emb)
-        x = F.silu(x)
-        action_time_emb = self.action_time_mlp_out(x)
-
-        adarms_cond = None  # Can be computed if needed
-
-        embs.append(action_time_emb)
-        batch_size, action_time_dim = action_time_emb.shape[:2]
-        action_time_mask = torch.ones(batch_size, action_time_dim, dtype=torch.bool, device=device)
-        pad_masks.append(action_time_mask)
-
-        # Attention pattern: state can see everything, actions are causal
-        att_masks.extend([1] + [0] * (self.config.chunk_size - 1))
-
-        embs = torch.cat(embs, dim=1)
-        pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=device)
-        att_masks = att_masks[None, :].expand(batch_size, len(att_masks))
-
-        return embs, pad_masks, att_masks, adarms_cond
+        return token_blocks
 
     def forward(
         self,
@@ -1375,6 +2007,9 @@ class MoTModel(nn.Module):
     ) -> Tensor:
         """
         Full training forward pass with flow matching loss.
+
+        Uses embed_all_nodes to create TokenBlocks for all configured nodes,
+        then processes through joint attention.
         """
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -1386,63 +2021,69 @@ class MoTModel(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        # Embed inputs
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks
-        )
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
-            state, x_t, time
-        )
+        # Prepare inputs dict for embed_all_nodes
+        inputs = {
+            "images": images,
+            "img_masks": img_masks,
+            "lang_tokens": lang_tokens,
+            "lang_masks": lang_masks,
+            "state": state,
+            "noisy_actions": x_t,
+            "timestep": time,
+        }
 
-        # Convert to appropriate dtype
+        # Embed all nodes into TokenBlocks
+        token_blocks = self.embed_all_nodes(inputs)
+
+        # Convert to appropriate dtype if needed
         vlm_backbone = list(self.backbones.values())[0]
-        if hasattr(vlm_backbone, 'language_model') and vlm_backbone.language_model.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
-            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
-            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
+        target_dtype = None
+        if hasattr(vlm_backbone, 'language_model'):
+            weight = vlm_backbone.language_model.layers[0].self_attn.q_proj.weight
+            if weight.dtype == torch.bfloat16:
+                target_dtype = torch.bfloat16
 
-        token_blocks = [
-            TokenBlock(
-                node_name="vlm",
-                embeddings=prefix_embs,
-                pad_mask=prefix_pad_masks,
-                att_mask=prefix_att_masks,
-            ),
-            TokenBlock(
-                node_name="action_expert",
-                embeddings=suffix_embs,
-                pad_mask=suffix_pad_masks,
-                att_mask=suffix_att_masks,
-            ),
-        ]
+        if target_dtype is not None:
+            for block in token_blocks:
+                block.embeddings = block.embeddings.to(dtype=target_dtype)
 
-        # 准备 AdaRMS 条件
+        # Prepare AdaRMS conditions (if any node provides them)
         adarms_conds = {}
-        if adarms_cond is not None and "action_expert" in self.node_to_backbone:
-            expert_backbone_name = self.node_to_backbone["action_expert"]
-            adarms_conds[expert_backbone_name] = adarms_cond
+        for node in self.config.nodes:
+            if node.name in self.input_embedders:
+                embedder = self.input_embedders[node.name]
+                cond = embedder.get_adarms_cond(time=time, batch=inputs)
+                if cond is not None and node.backbone_name:
+                    adarms_conds[node.backbone_name] = cond
 
-        # 调用异构联合注意力 (不再使用 torch.cat)
+        # Run joint attention
         output_blocks, _ = self.joint_attention(
             token_blocks,
             use_cache=False,
             adarms_conds=adarms_conds
         )
 
-        # 提取 Action 输出
-        suffix_out = None
-        for block in output_blocks:
-            if block.node_name == "action_expert":
-                suffix_out = block.embeddings
+        # Find the action output node
+        action_out = None
+        action_node_name = None
+        for node in self.config.nodes:
+            if node.is_output and node.node_type in [NodeType.ACTION, NodeType.LM]:
+                action_node_name = node.name
                 break
 
-        if suffix_out is None:
-            raise ValueError("Action expert output not found!")
+        for block in output_blocks:
+            if block.node_name == action_node_name:
+                action_out = block.embeddings
+                break
 
-        # 截取最后 chunk_size 个 token
-        suffix_out = suffix_out[:, -self.config.chunk_size:]
-        suffix_out = suffix_out.to(dtype=torch.float32)
+        if action_out is None:
+            raise ValueError(f"Action output node '{action_node_name}' not found in output blocks!")
 
-        v_t = self.action_out_proj(suffix_out)
+        # Extract last chunk_size tokens for action prediction
+        action_out = action_out[:, -self.config.chunk_size:]
+        action_out = action_out.to(dtype=torch.float32)
+
+        v_t = self.action_out_proj(action_out)
 
         return F.mse_loss(u_t, v_t, reduction="none")
 
@@ -1460,6 +2101,9 @@ class MoTModel(nn.Module):
     ) -> Tensor:
         """
         Sample actions using flow matching denoising.
+
+        Embeds static inputs (images, language) once, then iteratively
+        denoises the action sequence.
         """
         if num_steps is None:
             num_steps = self.config.num_inference_steps
@@ -1471,25 +2115,78 @@ class MoTModel(nn.Module):
             actions_shape = (batch_size, self.config.chunk_size, self.config.max_action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        # Embed prefix once
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks
-        )
+        # Prepare static inputs (images + language) - embedded once
+        static_inputs = {
+            "images": images,
+            "img_masks": img_masks,
+            "lang_tokens": lang_tokens,
+            "lang_masks": lang_masks,
+        }
+
+        # Get static token blocks (VLM nodes)
+        static_token_blocks = []
+        for node in self.config.nodes:
+            if node.name not in self.input_embedders:
+                continue
+            embedder = self.input_embedders[node.name]
+            embed_type = node.input_config.embed_type if node.input_config else EmbedType.CUSTOM
+
+            # Only process vision/language nodes as static
+            if embed_type == EmbedType.VISION:
+                embs, pad_mask, att_mask = embedder.embed_vision(
+                    images=images, img_masks=img_masks
+                )
+                # Also add language if this is a VLM node
+                if node.node_type == NodeType.VLM:
+                    lang_embs, lang_pad, lang_att = embedder.embed_language(
+                        tokens=lang_tokens, masks=lang_masks
+                    )
+                    embs = torch.cat([embs, lang_embs], dim=1)
+                    pad_mask = torch.cat([pad_mask, lang_pad], dim=1)
+                    att_mask = torch.cat([att_mask, lang_att], dim=1)
+
+                static_token_blocks.append(TokenBlock(
+                    node_name=node.name,
+                    embeddings=embs,
+                    pad_mask=pad_mask,
+                    att_mask=att_mask,
+                ))
+            elif embed_type == EmbedType.LANGUAGE:
+                embs, pad_mask, att_mask = embedder.embed_language(
+                    tokens=lang_tokens, masks=lang_masks
+                )
+                static_token_blocks.append(TokenBlock(
+                    node_name=node.name,
+                    embeddings=embs,
+                    pad_mask=pad_mask,
+                    att_mask=att_mask,
+                ))
+
+        # Convert static blocks to target dtype
+        vlm_backbone = list(self.backbones.values())[0]
+        target_dtype = None
+        if hasattr(vlm_backbone, 'language_model'):
+            weight = vlm_backbone.language_model.layers[0].self_attn.q_proj.weight
+            if weight.dtype == torch.bfloat16:
+                target_dtype = torch.bfloat16
+
+        if target_dtype is not None:
+            for block in static_token_blocks:
+                block.embeddings = block.embeddings.to(dtype=target_dtype)
 
         dt = -1.0 / num_steps
         x_t = noise
 
         for step in range(num_steps):
-            time = 1.0 + step * dt
-            time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(batch_size)
+            time_val = 1.0 + step * dt
+            time_tensor = torch.tensor(time_val, dtype=torch.float32, device=device).expand(batch_size)
 
             v_t = self._denoise_step(
                 state=state,
-                prefix_embs=prefix_embs,
-                prefix_pad_masks=prefix_pad_masks,
-                prefix_att_masks=prefix_att_masks,
+                static_token_blocks=static_token_blocks,
                 x_t=x_t,
                 timestep=time_tensor,
+                target_dtype=target_dtype,
             )
 
             x_t = x_t + dt * v_t
@@ -1499,64 +2196,90 @@ class MoTModel(nn.Module):
     def _denoise_step(
         self,
         state: Tensor,
-        prefix_embs: Tensor,
-        prefix_pad_masks: Tensor,
-        prefix_att_masks: Tensor,
+        static_token_blocks: list[TokenBlock],
         x_t: Tensor,
         timestep: Tensor,
+        target_dtype: torch.dtype | None = None,
     ) -> Tensor:
-        """Single denoising step."""
-        # Embed suffix (state + action + time)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
-            state, x_t, timestep
-        )
+        """
+        Single denoising step.
 
-        # Convert dtypes if needed
-        vlm_backbone = list(self.backbones.values())[0]
-        if hasattr(vlm_backbone, 'language_model') and vlm_backbone.language_model.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
-            # prefix_embs 应该已经是正确的 dtype，但确保 suffix 也是
-            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
-
-        # 组装 Token Blocks (复用传入的 prefix_embs)
-        token_blocks = [
-            TokenBlock(
-                node_name="vlm",
-                embeddings=prefix_embs,
-                pad_mask=prefix_pad_masks,
-                att_mask=prefix_att_masks,
-            ),
-            TokenBlock(
-                node_name="action_expert",
-                embeddings=suffix_embs,
-                pad_mask=suffix_pad_masks,
-                att_mask=suffix_att_masks,
-            ),
-        ]
-
-        # 准备 AdaRMS
+        Combines pre-computed static token blocks with dynamic action embeddings.
+        """
+        # Find action/state node and embed dynamic inputs
+        dynamic_token_blocks = []
         adarms_conds = {}
-        if adarms_cond is not None and "action_expert" in self.node_to_backbone:
-            expert_backbone_name = self.node_to_backbone["action_expert"]
-            adarms_conds[expert_backbone_name] = adarms_cond
 
-        # 调用 Joint Attention
+        for node in self.config.nodes:
+            if node.name not in self.input_embedders:
+                continue
+            embedder = self.input_embedders[node.name]
+            embed_type = node.input_config.embed_type if node.input_config else EmbedType.CUSTOM
+
+            # Process state and action nodes dynamically
+            if embed_type == EmbedType.STATE:
+                embs, pad_mask, att_mask = embedder.embed_state(state=state)
+                dynamic_token_blocks.append(TokenBlock(
+                    node_name=node.name,
+                    embeddings=embs,
+                    pad_mask=pad_mask,
+                    att_mask=att_mask,
+                ))
+            elif embed_type == EmbedType.ACTION:
+                embs, pad_mask, att_mask = embedder.embed_action(
+                    actions=x_t, timestep=timestep
+                )
+                dynamic_token_blocks.append(TokenBlock(
+                    node_name=node.name,
+                    embeddings=embs,
+                    pad_mask=pad_mask,
+                    att_mask=att_mask,
+                ))
+                # Get AdaRMS condition if applicable
+                cond = embedder.get_adarms_cond(time=timestep)
+                if cond is not None and node.backbone_name:
+                    adarms_conds[node.backbone_name] = cond
+
+        # Convert dynamic blocks to target dtype
+        if target_dtype is not None:
+            for block in dynamic_token_blocks:
+                block.embeddings = block.embeddings.to(dtype=target_dtype)
+
+        # Combine static and dynamic token blocks in node order
+        all_blocks = []
+        static_dict = {b.node_name: b for b in static_token_blocks}
+        dynamic_dict = {b.node_name: b for b in dynamic_token_blocks}
+
+        for node in self.config.nodes:
+            if node.name in static_dict:
+                all_blocks.append(static_dict[node.name])
+            elif node.name in dynamic_dict:
+                all_blocks.append(dynamic_dict[node.name])
+
+        # Run joint attention
         output_blocks, _ = self.joint_attention(
-            token_blocks,
-            use_cache=False, # 推理时暂不使用 Cache 以确保异构架构的正确性
+            all_blocks,
+            use_cache=False,
             adarms_conds=adarms_conds
         )
 
-        # 提取输出
-        suffix_out = None
-        for block in output_blocks:
-            if block.node_name == "action_expert":
-                suffix_out = block.embeddings
+        # Find action output
+        action_out = None
+        action_node_name = None
+        for node in self.config.nodes:
+            if node.is_output and node.node_type in [NodeType.ACTION, NodeType.LM]:
+                action_node_name = node.name
                 break
 
-        suffix_out = suffix_out[:, -self.config.chunk_size:]
-        suffix_out = suffix_out.to(dtype=torch.float32)
+        for block in output_blocks:
+            if block.node_name == action_node_name:
+                action_out = block.embeddings
+                break
 
-        return self.action_out_proj(suffix_out)
+        action_out = action_out[:, -self.config.chunk_size:]
+        action_out = action_out.to(dtype=torch.float32)
+
+        return self.action_out_proj(action_out)
 
 # ==================== Policy Class ====================
 

@@ -78,6 +78,83 @@ class DecodingMode(str, Enum):
     DIRECT = "direct"                   # Direct MLP prediction (ACT-like)
 
 
+class EmbedType(str, Enum):
+    """Type of input embedding for a node."""
+    VISION = "vision"               # Image embedding via vision encoder
+    LANGUAGE = "language"           # Language token embedding
+    STATE = "state"                 # State embedding (linear projection)
+    ACTION = "action"               # Action embedding with optional time fusion
+    FLOW_TIME = "flow_time"         # Flow matching timestep embedding
+    CUSTOM = "custom"               # Custom embedding function
+
+
+@dataclass
+class NodeInputConfig:
+    """
+    Configuration for how a node receives and embeds its inputs.
+
+    This provides a configurable per-node embedding specification where each
+    node defines its own embedding logic through embed_type and related options.
+
+    Attributes:
+        embed_type: Type of embedding to use (VISION, LANGUAGE, STATE, ACTION, FLOW_TIME, CUSTOM)
+        input_keys: Keys in the batch dict to use as input
+
+        # For VISION type
+        use_multi_image: Whether to process multiple images
+        image_keys: Specific image keys to use (if None, uses all)
+
+        # For LANGUAGE type
+        tokenizer_name: Tokenizer to use for text
+        vocab_scale: Scale factor for token embeddings
+
+        # For STATE type
+        state_dim: Input state dimension
+
+        # For ACTION type
+        action_dim: Action dimension
+        use_time_embedding: Whether to add time embedding for flow matching
+        time_embed_dim: Dimension of time embedding
+        use_mlp_fusion: Whether to use MLP for action-time fusion
+
+        # Attention mask pattern
+        attention_pattern: How this node's tokens should attend
+            "bidirectional": All tokens can see all other tokens
+            "causal": Tokens can only see past tokens
+            "prefix": First token is bidirectional, rest are causal (Prefix-LM style)
+    """
+    embed_type: EmbedType | str = EmbedType.CUSTOM
+    input_keys: list[str] = field(default_factory=list)
+
+    # VISION specific
+    use_multi_image: bool = True
+    image_keys: list[str] | None = None
+
+    # LANGUAGE specific
+    tokenizer_name: str | None = None
+    vocab_scale: float = 1.0
+    add_newline: bool = True  # For PaliGemma compatibility
+
+    # STATE specific
+    state_dim: int = 32
+
+    # ACTION specific (also used for flow matching)
+    action_dim: int = 32
+    use_time_embedding: bool = True
+    time_embed_dim: int | None = None  # Defaults to hidden_size
+    use_mlp_fusion: bool = True
+
+    # Attention pattern
+    attention_pattern: Literal["bidirectional", "causal", "prefix"] = "bidirectional"
+
+    # Custom embedding function name (for CUSTOM type)
+    custom_embed_fn: str | None = None
+
+    def __post_init__(self):
+        if isinstance(self.embed_type, str):
+            self.embed_type = EmbedType(self.embed_type)
+
+
 @dataclass
 class MoTNodeConfig:
     """
@@ -141,6 +218,9 @@ class MoTNodeConfig:
     embed_vocab_size: int | None = None
     embed_scale: float = 1.0
 
+    # Input embedding configuration (new generalized system)
+    input_config: NodeInputConfig | None = None
+
     # Additional config passed to the underlying encoder/decoder
     extra_config: dict[str, Any] = field(default_factory=dict)
 
@@ -154,8 +234,63 @@ class MoTNodeConfig:
             num_patches = (self.image_size // self.patch_size) ** 2
             self.max_tokens = num_patches
 
+        # Auto-create input_config based on node_type if not provided
+        if self.input_config is None and self.is_input:
+            self.input_config = self._create_default_input_config()
+
         if self.is_output and self.output_dim is None:
             self.output_dim = self.input_dim
+
+    def _create_default_input_config(self) -> NodeInputConfig:
+        """Create default input config based on node type."""
+        if self.node_type == NodeType.VLM:
+            # VLM nodes handle both vision and language
+            return NodeInputConfig(
+                embed_type=EmbedType.VISION,
+                use_multi_image=True,
+                attention_pattern="bidirectional",
+            )
+        elif self.node_type == NodeType.VISION:
+            return NodeInputConfig(
+                embed_type=EmbedType.VISION,
+                use_multi_image=True,
+                attention_pattern="bidirectional",
+            )
+        elif self.node_type == NodeType.LANGUAGE:
+            return NodeInputConfig(
+                embed_type=EmbedType.LANGUAGE,
+                vocab_scale=1.0,
+                attention_pattern="bidirectional",
+            )
+        elif self.node_type == NodeType.STATE:
+            return NodeInputConfig(
+                embed_type=EmbedType.STATE,
+                state_dim=self.input_dim,
+                attention_pattern="bidirectional",
+            )
+        elif self.node_type == NodeType.ACTION:
+            return NodeInputConfig(
+                embed_type=EmbedType.ACTION,
+                action_dim=self.input_dim,
+                use_time_embedding=True,
+                use_mlp_fusion=True,
+                attention_pattern="causal",
+            )
+        elif self.node_type == NodeType.LM:
+            # LM nodes typically used as action experts with flow matching
+            return NodeInputConfig(
+                embed_type=EmbedType.ACTION,
+                action_dim=self.input_dim,
+                use_time_embedding=True,
+                use_mlp_fusion=True,
+                attention_pattern="causal",
+            )
+        else:
+            # Default custom
+            return NodeInputConfig(
+                embed_type=EmbedType.CUSTOM,
+                attention_pattern="bidirectional",
+            )
 
 
 @dataclass

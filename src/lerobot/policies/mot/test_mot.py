@@ -1,64 +1,101 @@
 import torch
 
-from lerobot.configs.types import FeatureType, PolicyFeature
-from lerobot.policies.mot.configuration_mot import make_pi0_config
-from lerobot.policies.mot.modeling_mot import MoTPolicy
-from lerobot.utils.constants import (OBS_LANGUAGE_ATTENTION_MASK,
-                                     OBS_LANGUAGE_TOKENS)
+from lerobot.policies.mot.configuration_mot import (AttentionType,
+                                                    BackboneType, DecodingMode,
+                                                    MoTBackboneConfig,
+                                                    MoTConfig, MoTFlowConfig,
+                                                    MoTNodeConfig, NodeType)
+from lerobot.policies.mot.modeling_mot import MoTModel, TokenBlock
 
 
-def verify_pi0_reproduction():
-    # 1. 创建配置
-    config = make_pi0_config()
-    # 强制把维度改小以便在 CPU 上快速测试，或者保留默认测试显存
-    # config.backbones[0].hidden_size = 2048 (PaliGemma)
-    # config.backbones[1].hidden_size = 1024 (Gemma Expert)
+def test_heterogeneous_core():
+    print("=== Test 2: Heterogeneous Core (Backbone Mixing) ===")
 
-    config.input_features["observation.images.camera_0"] = PolicyFeature(
-        type=FeatureType.VISUAL,
-        shape=(3, 224, 224)
+    # 1. 定义异构配置: VLM (Hidden=64) + Expert (Hidden=32)
+    # 只要 head_dim * num_heads 相同，就能联通
+    head_dim = 8
+    num_heads = 4
+    shared_head_space = head_dim * num_heads # 32
+
+    print(f"[1] Configuring Heterogeneous Backbones (64dim <-> 32dim)...")
+
+    backbone_vlm = MoTBackboneConfig(
+        name="backbone_A",
+        backbone_type=BackboneType.GEMMA, # 用 Gemma 模拟结构
+        variant="gemma_2b",
+        hidden_size=64,     # <--- 维度 A
+        num_hidden_layers=2,
+        num_attention_heads=num_heads,
+        head_dim=head_dim,
+        intermediate_size=128
     )
-    # =================================
 
-    print("Initializing MoT-pi0 Policy...")
-    policy = MoTPolicy(config)
-    policy.eval()
-    # 2. 构造 Dummy Data
+    backbone_expert = MoTBackboneConfig(
+        name="backbone_B",
+        backbone_type=BackboneType.GEMMA,
+        variant="gemma_2b",
+        hidden_size=32,     # <--- 维度 B (不同!)
+        num_hidden_layers=2,
+        num_attention_heads=num_heads, # 必须相同
+        head_dim=head_dim,             # 必须相同
+        intermediate_size=64
+    )
+
+    nodes = [
+        MoTNodeConfig(name="node_A", backbone_name="backbone_A", input_dim=64, node_type=NodeType.VISION),
+        MoTNodeConfig(name="node_B", backbone_name="backbone_B", input_dim=32, node_type=NodeType.ACTION, is_output=True)
+    ]
+
+    # 让 B 关注 A (Prefix Attention)
+    flows = [
+        MoTFlowConfig(source="node_A", target="node_A", attention_type=AttentionType.FULL),
+        MoTFlowConfig(source="node_A", target="node_B", attention_type=AttentionType.FULL),
+        MoTFlowConfig(source="node_B", target="node_B", attention_type=AttentionType.CAUSAL),
+    ]
+
+    config = MoTConfig(
+        nodes=nodes, flows=flows, backbones=[backbone_vlm, backbone_expert],
+        decoding_mode=DecodingMode.FLOW_MATCHING
+    )
+
+    # 2. 初始化模型
+    model = MoTModel(config)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+
+    # 3. 手动构造 Token Blocks (模拟 Embedder 的输出)
     batch_size = 2
-    device = policy.device
 
-    # PaliGemma Image Input (SigLIP style normalized)
-    images = torch.randn(batch_size, 3, 224, 224, device=device)
+    # Block A: 模拟 Vision (64 dim)
+    emb_A = torch.randn(batch_size, 10, 64, device=device) # Seq=10
+    mask_A = torch.ones(batch_size, 10, dtype=torch.bool, device=device)
+    att_A = torch.zeros(batch_size, 10, device=device) # Full
 
-    # Language Input
-    lang_tokens = torch.randint(0, 1000, (batch_size, 10), device=device)
-    lang_mask = torch.ones(batch_size, 10, dtype=torch.bool, device=device)
+    # Block B: 模拟 Action (32 dim)
+    emb_B = torch.randn(batch_size, 5, 32, device=device) # Seq=5
+    mask_B = torch.ones(batch_size, 5, dtype=torch.bool, device=device)
+    att_B = torch.ones(batch_size, 5, device=device) # Causal
 
-    # State Input
-    state = torch.randn(batch_size, 32, device=device) # max_state_dim
+    blocks = [
+        TokenBlock("node_A", emb_A, mask_A, att_A),
+        TokenBlock("node_B", emb_B, mask_B, att_B)
+    ]
 
-    # Action Input (Chunk)
-    actions = torch.randn(batch_size, 50, 32, device=device) # chunk_size=50, max_action_dim=32
+    # 4. 测试 Joint Attention
+    print("[2] Running Joint Attention...")
+    output_blocks, _ = model.joint_attention(blocks)
 
-    batch = {
-        "observation.images.camera_0": images,
-        OBS_LANGUAGE_TOKENS: lang_tokens,
-        OBS_LANGUAGE_ATTENTION_MASK: lang_mask,
-        "observation.state": state,
-        "action": actions
-    }
+    out_A = output_blocks[0].embeddings
+    out_B = output_blocks[1].embeddings
 
-    # 3. 运行 Forward (Training Loss)
-    print("Running Forward Pass (Flow Matching Loss)...")
-    loss, _ = policy(batch)
-    print(f"✅ Loss computed: {loss.item()}")
+    print(f"   ✓ Input A: {emb_A.shape} -> Output A: {out_A.shape}")
+    print(f"   ✓ Input B: {emb_B.shape} -> Output B: {out_B.shape}")
 
-    # 4. 运行 Inference (Action Sampling)
-    print("Running Inference (Action Generation)...")
-    # 减少步数以加快测试
-    with torch.no_grad():
-        generated_actions = policy.select_action(batch)
-    print(f"✅ Action generated. Shape: {generated_actions.shape}")
+    # 验证维度保持不变
+    assert out_A.shape[-1] == 64, "Output A dimension mismatch!"
+    assert out_B.shape[-1] == 32, "Output B dimension mismatch!"
+
+    print("=== Heterogeneous Core Test Passed! ===\n")
 
 if __name__ == "__main__":
-    verify_pi0_reproduction()
+    test_heterogeneous_core()
