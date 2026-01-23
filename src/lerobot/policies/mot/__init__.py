@@ -20,8 +20,12 @@ MoT (Mixture of Transformers) Policy for LeRobot.
 This module provides a highly configurable multi-transformer architecture that allows:
 - Defining arbitrary numbers of transformer nodes (vision, state, action, etc.)
 - Configuring attention flows between nodes via configuration
-- Swapping underlying transformer implementations (PaliGemma, Gemma, Bagel, etc.)
+- Swapping underlying transformer implementations (PaliGemma, Gemma, LLaMA, Qwen, etc.)
 - Supporting pi0, pi0.5, pi0FAST architectures through configuration alone
+
+The backbone adapter system (in `backbones/`) uses a registry pattern for extensibility:
+- To add new backbone types, create an adapter in `backbones/` and register it
+- See `backbones/base.py` for the interface all adapters must implement
 
 Example usage:
     from lerobot.policies.mot import MoTConfig, MoTPolicy
@@ -37,18 +41,45 @@ Example usage:
         ],
     )
     policy = MoTPolicy(config)
+
+    # To add a custom backbone:
+    from lerobot.policies.mot.backbones import BackboneAdapter, BackboneRegistry
+
+    @BackboneRegistry.register("my_backbone")
+    class MyBackboneAdapter(BackboneAdapter):
+        def setup_model(self):
+            ...
+        def load_pretrained(self, path, **kwargs):
+            ...
+        @property
+        def layers(self):
+            ...
+        @property
+        def norm(self):
+            ...
 """
 
+# Expose backbone system for extensibility
+from .backbones import (BackboneAdapter, BackboneRegistry, build_backbone,
+                        get_backbone_preset)
 from .configuration_mot import (MoTBackboneConfig, MoTConfig, MoTFlowConfig,
                                 MoTNodeConfig)
 from .modeling_mot import MoTPolicy
 from .processor_mot import make_mot_pre_post_processors
 
 __all__ = [
+    # Configuration
     "MoTConfig",
     "MoTNodeConfig",
     "MoTFlowConfig",
     "MoTBackboneConfig",
+    # Policy
     "MoTPolicy",
+    # Processors
     "make_mot_pre_post_processors",
+    # Backbone system
+    "BackboneAdapter",
+    "BackboneRegistry",
+    "build_backbone",
+    "get_backbone_preset",
 ]

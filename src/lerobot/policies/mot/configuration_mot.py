@@ -394,7 +394,15 @@ class MoTBackboneConfig:
             self.adarms_cond_dim = self.hidden_size
 
 
-# Preset configurations for common model variants
+# ==================== Preset Configurations ====================
+# Note: Model-specific presets are now maintained in their respective adapter files:
+#   - backbones/gemma.py: GEMMA_300M_DEFAULTS, GEMMA_2B_DEFAULTS
+#   - backbones/paligemma.py: PALIGEMMA_2B_DEFAULTS
+#   - backbones/llama.py: LLAMA_*_DEFAULTS
+#   - backbones/qwen.py: QWEN_*_DEFAULTS
+#
+# These are kept here for backward compatibility with existing configs.
+
 GEMMA_300M_CONFIG = {
     "hidden_size": 1024,
     "num_hidden_layers": 18,
@@ -422,15 +430,41 @@ PALIGEMMA_2B_VISION_CONFIG = {
 
 
 def get_backbone_preset(variant: str) -> dict[str, Any]:
-    """Get preset configuration for a known backbone variant."""
-    presets = {
+    """
+    Get preset configuration for a known backbone variant.
+
+    This function delegates to the backbone module's registry for comprehensive
+    preset support across all registered backbone types.
+
+    Args:
+        variant: Variant name (e.g., "gemma_2b", "paligemma_2b", "llama3_8b")
+
+    Returns:
+        Dictionary of configuration values
+
+    Note:
+        For the most up-to-date presets, use:
+            from lerobot.policies.mot.backbones import get_backbone_preset
+    """
+    # Try the local presets first for backward compatibility
+    local_presets = {
         "gemma_300m": GEMMA_300M_CONFIG,
         "gemma_2b": GEMMA_2B_CONFIG,
         "paligemma_2b": {**GEMMA_2B_CONFIG, **PALIGEMMA_2B_VISION_CONFIG},
     }
-    if variant not in presets:
-        raise ValueError(f"Unknown backbone variant: {variant}. Available: {list(presets.keys())}")
-    return presets[variant]
+
+    if variant in local_presets:
+        return local_presets[variant].copy()
+
+    # Fall back to backbone module presets for extended support
+    try:
+        from lerobot.policies.mot.backbones import \
+            get_backbone_preset as _get_preset
+        return _get_preset(variant)
+    except (ImportError, ValueError):
+        pass
+
+    raise ValueError(f"Unknown backbone variant: {variant}. Available: {list(local_presets.keys())}")
 
 
 @PreTrainedConfig.register_subclass("mot")

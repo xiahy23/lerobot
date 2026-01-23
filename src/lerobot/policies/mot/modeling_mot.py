@@ -4,11 +4,14 @@ MoT (Mixture of Transformers) Model Implementation.
 This module implements the core MoT architecture components:
 - MoTAttentionMaskBuilder: Generates dynamic attention masks from flow configurations
 - MoTEmbeddingRouter: Routes and projects inputs to the appropriate token spaces
-- MoTBackbone: Manages multiple transformer backbones with joint attention
+- MoTJointLayerAttention: Manages joint attention across multiple backbones
 - MoTPolicy: The main policy class that combines all components
 
 The key innovation is the dynamic mask generation that allows arbitrary attention
 patterns between transformer nodes, enabling flexible multi-transformer architectures.
+
+Backbone adapters are now modular and defined in the `backbones/` subpackage.
+See `backbones/__init__.py` for the registry and factory functions.
 """
 
 from __future__ import annotations
@@ -25,14 +28,11 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 from transformers import AutoTokenizer
-from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
-from transformers.models.gemma.modeling_gemma import GemmaForCausalLM
-from transformers.models.paligemma.modeling_paligemma import \
-    PaliGemmaForConditionalGeneration
 from typing_extensions import Unpack
 
 from lerobot.configs.policies import PreTrainedConfig
+from lerobot.policies.mot.backbones import BackboneAdapter, build_backbone
 from lerobot.policies.mot.configuration_mot import (AttentionType,
                                                     BackboneType, DecodingMode,
                                                     EmbedType,
@@ -161,24 +161,6 @@ def resize_with_pad_torch(
     return padded_images
 
 
-def make_att_2d_masks(pad_masks: Tensor, att_masks: Tensor) -> Tensor:
-    """
-    Create 2D attention masks from padding and attention masks.
-
-    This implements the big_vision attention mask logic that allows flexible
-    attention patterns through cumulative masking.
-    """
-    if att_masks.ndim != 2:
-        raise ValueError(f"att_masks must be 2D, got {att_masks.ndim}D")
-    if pad_masks.ndim != 2:
-        raise ValueError(f"pad_masks must be 2D, got {pad_masks.ndim}D")
-
-    cumsum = torch.cumsum(att_masks, dim=1)
-    att_2d_masks = cumsum[:, None, :] <= cumsum[:, :, None]
-    pad_2d_masks = pad_masks[:, None, :] * pad_masks[:, :, None]
-    return att_2d_masks & pad_2d_masks
-
-
 # ==================== Core MoT Components ====================
 
 @dataclass
@@ -187,7 +169,7 @@ class TokenBlock:
     node_name: str
     embeddings: Tensor        # (batch, seq_len, hidden_dim)
     pad_mask: Tensor          # (batch, seq_len) - True for valid tokens
-    att_mask: Tensor          # (batch, seq_len) - Attention mask pattern
+    att_mask: Tensor = None   # (batch, seq_len) - Attention mask pattern
     start_idx: int = 0        # Start index in concatenated sequence
     end_idx: int = 0          # End index in concatenated sequence
 
@@ -441,7 +423,7 @@ class NodeInputEmbedder(nn.Module):
     def __init__(
         self,
         node_config: MoTNodeConfig,
-        backbone: "MoTBackboneWrapper",
+        backbone: BackboneAdapter,
         config: MoTConfig,
     ):
         super().__init__()
@@ -891,430 +873,20 @@ class NodeInputEmbedder(nn.Module):
         return None
 
 
-# ==================== Backbone Interface ====================
-
-class BackboneInterface:
-    """
-    Interface that all backbone wrappers must implement.
-
-    This ensures consistent behavior across different transformer types
-    (PaliGemma, Gemma, LLaMA, Qwen, Bagel, etc.).
-    """
-
-    @property
-    def hidden_size(self) -> int:
-        """Return the hidden dimension of this backbone."""
-        raise NotImplementedError
-
-    @property
-    def num_layers(self) -> int:
-        """Return the number of transformer layers."""
-        raise NotImplementedError
-
-    @property
-    def num_heads(self) -> int:
-        """Return the number of attention heads."""
-        raise NotImplementedError
-
-    @property
-    def head_dim(self) -> int:
-        """Return the dimension of each attention head."""
-        raise NotImplementedError
-
-    @property
-    def num_kv_heads(self) -> int:
-        """Return the number of key/value heads (for GQA)."""
-        raise NotImplementedError
-
-    def embed_tokens(self, tokens: Tensor) -> Tensor:
-        """Embed language tokens."""
-        raise NotImplementedError
-
-    def embed_image(self, image: Tensor) -> Tensor:
-        """Embed images (only for VLM backbones)."""
-        raise NotImplementedError
-
-    def get_layer(self, layer_idx: int) -> nn.Module:
-        """Get a specific transformer layer."""
-        raise NotImplementedError
-
-    def get_norm(self) -> nn.Module:
-        """Get the final normalization layer."""
-        raise NotImplementedError
-
-    def get_rotary_emb(self) -> nn.Module | None:
-        """Get the rotary embedding module if available."""
-        raise NotImplementedError
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_path: str,
-        config: MoTBackboneConfig,
-        **kwargs,
-    ) -> "BackboneInterface":
-        """Load pretrained weights."""
-        raise NotImplementedError
-
-
-class MoTBackboneWrapper(nn.Module, BackboneInterface):
-    """
-    Wraps a HuggingFace transformer backbone for use in MoT.
-
-    This wrapper provides a unified interface for different backbone types
-    (PaliGemma, Gemma, LLaMA, etc.) and handles the specifics of each.
-    """
-
-    def __init__(self, backbone_config: MoTBackboneConfig):
-        super().__init__()
-        self.backbone_config = backbone_config
-        self.model = None
-        self.vision_encoder = None
-
-        self._init_backbone()
-
-    def _init_backbone(self):
-        """Initialize the underlying transformer backbone."""
-        if self.backbone_config.backbone_type == BackboneType.PALIGEMMA:
-            self._init_paligemma()
-        elif self.backbone_config.backbone_type == BackboneType.GEMMA:
-            self._init_gemma()
-        elif self.backbone_config.backbone_type == BackboneType.LLAMA:
-            self._init_llama()
-        elif self.backbone_config.backbone_type == BackboneType.BAGEL:
-            self._init_bagel()
-        elif self.backbone_config.backbone_type == BackboneType.QWEN:
-            self._init_qwen()
-        else:
-            raise ValueError(f"Unknown backbone type: {self.backbone_config.backbone_type}")
-
-    def _init_paligemma(self):
-        """Initialize PaliGemma backbone."""
-        cfg = self.backbone_config
-
-        hf_config = CONFIG_MAPPING["paligemma"]()
-        hf_config._vocab_size = cfg.vocab_size
-        hf_config.image_token_index = cfg.vocab_size
-        hf_config.text_config.hidden_size = cfg.hidden_size
-        hf_config.text_config.intermediate_size = cfg.intermediate_size
-        hf_config.text_config.num_attention_heads = cfg.num_attention_heads
-        hf_config.text_config.head_dim = cfg.head_dim
-        hf_config.text_config.num_hidden_layers = cfg.num_hidden_layers
-        hf_config.text_config.num_key_value_heads = cfg.num_key_value_heads
-        hf_config.text_config.hidden_activation = cfg.hidden_activation
-        hf_config.text_config.torch_dtype = "float32"
-        hf_config.text_config.vocab_size = cfg.vocab_size
-        hf_config.text_config.use_adarms = cfg.use_adarms
-        hf_config.text_config.adarms_cond_dim = cfg.adarms_cond_dim
-
-        if cfg.vision_hidden_size:
-            hf_config.vision_config.hidden_size = cfg.vision_hidden_size
-            hf_config.vision_config.intermediate_size = 4304
-            hf_config.vision_config.projection_dim = cfg.hidden_size
-            hf_config.vision_config.projector_hidden_act = "gelu_fast"
-        hf_config.vision_config.image_size = cfg.vision_image_size
-        hf_config.vision_config.patch_size = cfg.vision_patch_size
-
-        for key, value in cfg.hf_config_kwargs.items():
-            setattr(hf_config, key, value)
-
-        self.model = PaliGemmaForConditionalGeneration(config=hf_config)
-        self.vision_encoder = self.model.vision_tower
-        self.language_model = self.model.language_model
-
-        self._apply_precision(cfg.dtype)
-
-    def _init_gemma(self):
-        """Initialize Gemma backbone."""
-        cfg = self.backbone_config
-
-        hf_config = CONFIG_MAPPING["gemma"](
-            head_dim=cfg.head_dim,
-            hidden_size=cfg.hidden_size,
-            intermediate_size=cfg.intermediate_size,
-            num_attention_heads=cfg.num_attention_heads,
-            num_hidden_layers=cfg.num_hidden_layers,
-            num_key_value_heads=cfg.num_key_value_heads,
-            vocab_size=cfg.vocab_size,
-            hidden_activation=cfg.hidden_activation,
-            torch_dtype="float32",
-            use_adarms=cfg.use_adarms,
-            adarms_cond_dim=cfg.adarms_cond_dim,
-        )
-
-        for key, value in cfg.hf_config_kwargs.items():
-            setattr(hf_config, key, value)
-
-        self.model = GemmaForCausalLM(config=hf_config)
-        self.model.model.embed_tokens = None  # We use external embeddings
-        self.language_model = self.model.model
-
-        self._apply_precision(cfg.dtype)
-
-    def _init_llama(self):
-        """Initialize LLaMA backbone."""
-        # Similar to Gemma but with LLaMA-specific config
-        try:
-            from transformers.models.llama.modeling_llama import \
-                LlamaForCausalLM
-
-            cfg = self.backbone_config
-            hf_config = CONFIG_MAPPING["llama"](
-                hidden_size=cfg.hidden_size,
-                intermediate_size=cfg.intermediate_size,
-                num_attention_heads=cfg.num_attention_heads,
-                num_hidden_layers=cfg.num_hidden_layers,
-                num_key_value_heads=cfg.num_key_value_heads,
-                vocab_size=cfg.vocab_size,
-            )
-
-            self.model = LlamaForCausalLM(config=hf_config)
-            self.language_model = self.model.model
-            self._apply_precision(cfg.dtype)
-        except ImportError as e:
-            raise ImportError("LLaMA backbone requires transformers with LLaMA support") from e
-
-    def _init_bagel(self):
-        """Initialize Bagel backbone (placeholder for future implementation)."""
-        # Bagel is a newer model - this is a placeholder for when it's available
-        # For now, we can use a similar architecture to Gemma
-        logger.warning("Bagel backbone not yet implemented, using Gemma as fallback")
-        self._init_gemma()
-
-    def _init_qwen(self):
-        """Initialize Qwen backbone."""
-        try:
-            from transformers.models.qwen2.modeling_qwen2 import \
-                Qwen2ForCausalLM
-
-            cfg = self.backbone_config
-            hf_config = CONFIG_MAPPING["qwen2"](
-                hidden_size=cfg.hidden_size,
-                intermediate_size=cfg.intermediate_size,
-                num_attention_heads=cfg.num_attention_heads,
-                num_hidden_layers=cfg.num_hidden_layers,
-                num_key_value_heads=cfg.num_key_value_heads,
-                vocab_size=cfg.vocab_size,
-            )
-
-            self.model = Qwen2ForCausalLM(config=hf_config)
-            self.language_model = self.model.model
-            self._apply_precision(cfg.dtype)
-        except ImportError as e:
-            raise ImportError("Qwen backbone requires transformers with Qwen2 support") from e
-
-    def _apply_precision(self, dtype: str):
-        """Apply precision settings to the model."""
-        if dtype == "bfloat16":
-            self.model.to(dtype=torch.bfloat16)
-            # Keep certain params in float32 for stability
-            for name, param in self.model.named_parameters():
-                if any(s in name for s in ["layernorm", "norm", "embedding"]):
-                    param.data = param.data.to(dtype=torch.float32)
-        elif dtype == "float32":
-            self.model.to(dtype=torch.float32)
-
-    @property
-    def hidden_size(self) -> int:
-        return self.backbone_config.hidden_size
-
-    @property
-    def num_layers(self) -> int:
-        return self.backbone_config.num_hidden_layers
-
-    @property
-    def num_heads(self) -> int:
-        return self.backbone_config.num_attention_heads
-
-    @property
-    def head_dim(self) -> int:
-        return self.backbone_config.head_dim
-
-    @property
-    def num_kv_heads(self) -> int:
-        return self.backbone_config.num_key_value_heads
-
-    def embed_tokens(self, tokens: Tensor) -> Tensor:
-        """Embed language tokens."""
-        if hasattr(self, 'language_model') and hasattr(self.language_model, 'embed_tokens'):
-            if self.language_model.embed_tokens is not None:
-                return self.language_model.embed_tokens(tokens)
-        if hasattr(self.model, 'embed_tokens'):
-            return self.model.embed_tokens(tokens)
-        raise ValueError("No token embedding layer found")
-
-    def embed_image(self, image: Tensor) -> Tensor:
-        """Embed image through vision encoder."""
-        if hasattr(self.model, 'get_image_features'):
-            return self.model.get_image_features(image)
-        if self.vision_encoder is None:
-            raise ValueError("This backbone does not have a vision encoder")
-        return self.vision_encoder(image)
-
-    def get_layer(self, layer_idx: int) -> nn.Module:
-        """Get a specific transformer layer."""
-        if hasattr(self, 'language_model') and hasattr(self.language_model, 'layers'):
-            return self.language_model.layers[layer_idx]
-        elif hasattr(self, 'model') and hasattr(self.model, 'layers'):
-            return self.model.layers[layer_idx]
-        else:
-            raise ValueError("Cannot find layers in backbone")
-
-    def get_norm(self) -> nn.Module:
-        """Get the final normalization layer."""
-        if hasattr(self, 'language_model') and hasattr(self.language_model, 'norm'):
-            return self.language_model.norm
-        elif hasattr(self, 'model') and hasattr(self.model, 'norm'):
-            return self.model.norm
-        else:
-            raise ValueError("Cannot find norm in backbone")
-
-    def get_rotary_emb(self) -> nn.Module | None:
-        """Get the rotary embedding module if available."""
-        if hasattr(self, 'language_model') and hasattr(self.language_model, 'rotary_emb'):
-            return self.language_model.rotary_emb
-        elif hasattr(self, 'model') and hasattr(self.model, 'language_model'):
-            lm = self.model.language_model
-            if hasattr(lm, 'rotary_emb'):
-                return lm.rotary_emb
-        return None
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_path: str,
-        backbone_config: MoTBackboneConfig,
-        **kwargs,
-    ) -> "MoTBackboneWrapper":
-        """
-        Load a backbone from pretrained weights.
-
-        Args:
-            pretrained_path: Path to pretrained weights (local or HuggingFace hub)
-            backbone_config: Configuration for the backbone
-            **kwargs: Additional arguments for loading
-
-        Returns:
-            Initialized backbone wrapper with loaded weights
-        """
-        # Create wrapper with config
-        wrapper = cls(backbone_config)
-
-        # Load weights based on backbone type
-        if backbone_config.backbone_type == BackboneType.PALIGEMMA:
-            wrapper._load_paligemma_weights(pretrained_path, **kwargs)
-        elif backbone_config.backbone_type == BackboneType.GEMMA:
-            wrapper._load_gemma_weights(pretrained_path, **kwargs)
-        elif backbone_config.backbone_type == BackboneType.LLAMA:
-            wrapper._load_llama_weights(pretrained_path, **kwargs)
-        elif backbone_config.backbone_type == BackboneType.QWEN:
-            wrapper._load_qwen_weights(pretrained_path, **kwargs)
-        else:
-            logger.warning(f"No pretrained loading implemented for {backbone_config.backbone_type}")
-
-        return wrapper
-
-    def _load_paligemma_weights(self, pretrained_path: str, **kwargs):
-        """Load PaliGemma pretrained weights."""
-        from transformers import \
-            PaliGemmaForConditionalGeneration as HFPaliGemma
-
-        try:
-            pretrained_model = HFPaliGemma.from_pretrained(
-                pretrained_path,
-                torch_dtype=torch.float32 if self.backbone_config.dtype == "float32" else torch.bfloat16,
-                **kwargs,
-            )
-
-            # Copy weights
-            missing, unexpected = self.model.load_state_dict(
-                pretrained_model.state_dict(), strict=False
-            )
-
-            if missing:
-                logger.warning(f"Missing keys when loading PaliGemma weights: {missing[:10]}...")
-            if unexpected:
-                logger.warning(f"Unexpected keys when loading PaliGemma weights: {unexpected[:10]}...")
-
-            del pretrained_model
-
-        except Exception as e:
-            logger.error(f"Failed to load PaliGemma weights from {pretrained_path}: {e}")
-            raise
-
-    def _load_gemma_weights(self, pretrained_path: str, **kwargs):
-        """Load Gemma pretrained weights."""
-        from transformers import GemmaForCausalLM as HFGemma
-
-        try:
-            pretrained_model = HFGemma.from_pretrained(
-                pretrained_path,
-                torch_dtype=torch.float32 if self.backbone_config.dtype == "float32" else torch.bfloat16,
-                **kwargs,
-            )
-
-            missing, unexpected = self.model.load_state_dict(
-                pretrained_model.state_dict(), strict=False
-            )
-
-            if missing:
-                logger.warning(f"Missing keys when loading Gemma weights: {missing[:10]}...")
-            if unexpected:
-                logger.warning(f"Unexpected keys when loading Gemma weights: {unexpected[:10]}...")
-
-            del pretrained_model
-
-        except Exception as e:
-            logger.error(f"Failed to load Gemma weights from {pretrained_path}: {e}")
-            raise
-
-    def _load_llama_weights(self, pretrained_path: str, **kwargs):
-        """Load LLaMA pretrained weights."""
-        try:
-            from transformers import LlamaForCausalLM as HFLlama
-
-            pretrained_model = HFLlama.from_pretrained(
-                pretrained_path,
-                torch_dtype=torch.float32 if self.backbone_config.dtype == "float32" else torch.bfloat16,
-                **kwargs,
-            )
-
-            missing, unexpected = self.model.load_state_dict(
-                pretrained_model.state_dict(), strict=False
-            )
-
-            if missing:
-                logger.warning(f"Missing keys when loading LLaMA weights: {missing[:10]}...")
-
-            del pretrained_model
-
-        except Exception as e:
-            logger.error(f"Failed to load LLaMA weights from {pretrained_path}: {e}")
-            raise
-
-    def _load_qwen_weights(self, pretrained_path: str, **kwargs):
-        """Load Qwen pretrained weights."""
-        try:
-            from transformers import Qwen2ForCausalLM as HFQwen
-
-            pretrained_model = HFQwen.from_pretrained(
-                pretrained_path,
-                torch_dtype=torch.float32 if self.backbone_config.dtype == "float32" else torch.bfloat16,
-                **kwargs,
-            )
-
-            missing, unexpected = self.model.load_state_dict(
-                pretrained_model.state_dict(), strict=False
-            )
-
-            if missing:
-                logger.warning(f"Missing keys when loading Qwen weights: {missing[:10]}...")
-
-            del pretrained_model
-
-        except Exception as e:
-            logger.error(f"Failed to load Qwen weights from {pretrained_path}: {e}")
-            raise
+# ==================== Backbone Adapters ====================
+# The backbone adapter system has been moved to lerobot.policies.mot.backbones
+# See:
+#   - backbones/base.py: BackboneAdapter abstract base class
+#   - backbones/gemma.py: GemmaAdapter for Gemma models
+#   - backbones/paligemma.py: PaliGemmaAdapter for PaliGemma VLM
+#   - backbones/llama.py: LlamaAdapter for LLaMA models
+#   - backbones/qwen.py: QwenAdapter for Qwen models
+#   - backbones/__init__.py: Registry and build_backbone factory
+#
+# To add a new backbone type:
+#   1. Create a new adapter file in backbones/
+#   2. Implement your adapter extending BackboneAdapter
+#   3. Register it in backbones/__init__.py
 
 
 class MoTJointLayerAttention(nn.Module):
@@ -1349,7 +921,7 @@ class MoTJointLayerAttention(nn.Module):
 
     def __init__(
         self,
-        backbones: dict[str, MoTBackboneWrapper],
+        backbones: dict[str, BackboneAdapter],
         node_to_backbone: dict[str, str],
         config: MoTConfig,
     ):
@@ -1372,13 +944,13 @@ class MoTJointLayerAttention(nn.Module):
         # Verify all backbones have compatible head_dim and num_heads
         # This is critical for heterogeneous joint attention
         first_backbone = list(backbones.values())[0]
-        first_cfg = first_backbone.backbone_config
+        first_cfg = first_backbone.config
         self.num_heads = first_cfg.num_attention_heads
         self.head_dim = first_cfg.head_dim
         self.num_kv_heads = first_cfg.num_key_value_heads
 
         for name, backbone in backbones.items():
-            cfg = backbone.backbone_config
+            cfg = backbone.config
             if cfg.num_attention_heads != self.num_heads:
                 raise ValueError(
                     f"All backbones must have same num_attention_heads for joint attention. "
@@ -1828,18 +1400,21 @@ class MoTModel(nn.Module):
         super().__init__()
         self.config = config
 
-        # Initialize backbones (with optional pretrained weights)
-        self.backbones: dict[str, MoTBackboneWrapper] = nn.ModuleDict()
+        # Initialize backbones using the adapter registry
+        self.backbones: dict[str, BackboneAdapter] = nn.ModuleDict()
         for backbone_cfg in config.backbones:
+            # Build backbone using the factory function
+            backbone = build_backbone(backbone_cfg)
+
+            # Load pretrained weights if specified
             if backbone_cfg.pretrained_path:
-                # Load from pretrained
-                self.backbones[backbone_cfg.name] = MoTBackboneWrapper.from_pretrained(
-                    backbone_cfg.pretrained_path,
-                    backbone_cfg,
-                )
-            else:
-                # Initialize from scratch
-                self.backbones[backbone_cfg.name] = MoTBackboneWrapper(backbone_cfg)
+                backbone.load_pretrained(backbone_cfg.pretrained_path)
+
+            # Apply freezing if configured
+            if backbone_cfg.freeze:
+                backbone.freeze()
+
+            self.backbones[backbone_cfg.name] = backbone
 
         # Build node-to-backbone mapping
         self.node_to_backbone: dict[str, str] = {}
