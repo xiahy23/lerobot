@@ -32,49 +32,34 @@ import torch
 import torch.utils
 from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.errors import RevisionNotFoundError
+from torchcodec.decoders import VideoDecoder
 
-from lerobot.datasets.compute_stats import aggregate_stats, compute_episode_stats
+from lerobot.datasets.compute_stats import (aggregate_stats,
+                                            compute_episode_stats)
 from lerobot.datasets.image_writer import AsyncImageWriter, write_image
-from lerobot.datasets.utils import (
-    DEFAULT_EPISODES_PATH,
-    DEFAULT_FEATURES,
-    DEFAULT_IMAGE_PATH,
-    INFO_PATH,
-    _validate_feature_names,
-    check_delta_timestamps,
-    check_version_compatibility,
-    create_empty_dataset_info,
-    create_lerobot_dataset_card,
-    embed_images,
-    flatten_dict,
-    get_delta_indices,
-    get_file_size_in_mb,
-    get_hf_features_from_features,
-    get_safe_version,
-    hf_transform_to_torch,
-    is_valid_version,
-    load_episodes,
-    load_info,
-    load_nested_dataset,
-    load_stats,
-    load_tasks,
-    update_chunk_file_indices,
-    validate_episode_buffer,
-    validate_frame,
-    write_info,
-    write_json,
-    write_stats,
-    write_tasks,
-)
-from lerobot.datasets.video_utils import (
-    VideoFrame,
-    concatenate_video_files,
-    decode_video_frames,
-    encode_video_frames,
-    get_safe_default_codec,
-    get_video_duration_in_s,
-    get_video_info,
-)
+from lerobot.datasets.utils import (DEFAULT_EPISODES_PATH, DEFAULT_FEATURES,
+                                    DEFAULT_IMAGE_PATH, INFO_PATH,
+                                    _validate_feature_names,
+                                    check_delta_timestamps,
+                                    check_version_compatibility,
+                                    create_empty_dataset_info,
+                                    create_lerobot_dataset_card, embed_images,
+                                    flatten_dict, get_delta_indices,
+                                    get_file_size_in_mb,
+                                    get_hf_features_from_features,
+                                    get_safe_version, hf_transform_to_torch,
+                                    is_valid_version, load_episodes, load_info,
+                                    load_nested_dataset, load_stats,
+                                    load_tasks, update_chunk_file_indices,
+                                    validate_episode_buffer, validate_frame,
+                                    write_info, write_json, write_stats,
+                                    write_tasks)
+from lerobot.datasets.video_utils import (VideoFrame, concatenate_video_files,
+                                          decode_video_frames,
+                                          encode_video_frames,
+                                          get_safe_default_codec,
+                                          get_video_duration_in_s,
+                                          get_video_info)
 from lerobot.utils.constants import HF_LEROBOT_HOME
 
 CODEBASE_VERSION = "v3.0"
@@ -1011,26 +996,59 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 result[key] = torch.stack(self.hf_dataset[relative_indices][key])
         return result
 
-    def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict[str, torch.Tensor]:
-        """Note: When using data workers (e.g. DataLoader with num_workers>0), do not call this function
-        in the main process (e.g. by using a second Dataloader with num_workers=0). It will result in a
-        Segmentation Fault. This probably happens because a memory reference to the video loader is created in
-        the main process and a subprocess fails to access it.
-        """
+    def _query_videos(self, current_item: dict, query_row_indices: dict[str, list[int]] | None, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict[str, torch.Tensor]:
         ep = self.meta.episodes[ep_idx]
-        item = {}
-        for vid_key, query_ts in query_timestamps.items():
-            # Episodes are stored sequentially on a single mp4 to reduce the number of files.
-            # Thus we load the start timestamp of the episode on this mp4 and,
-            # shift the query timestamp accordingly.
-            from_timestamp = ep[f"videos/{vid_key}/from_timestamp"]
-            shifted_query_ts = [from_timestamp + ts for ts in query_ts]
+        item_out = {}
 
+        # 预先获取当前 episode 的起始信息，用于时间戳逻辑的对齐
+        ep_start_idx = ep["dataset_from_index"]
+        ep_start_unix_ts = self.hf_dataset[ep_start_idx]["timestamp"].item()
+
+        for vid_key in self.meta.video_keys:
             video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
-            frames = decode_video_frames(video_path, shifted_query_ts, self.tolerance_s, self.video_backend)
-            item[vid_key] = frames.squeeze(0)
+            frame_idx_column = f"{vid_key}_frame_index"
 
-        return item
+            # =================================================================
+            # 分支 1：存在显式的帧索引列 (用户的新格式) -> 直接按 Index 抓取
+            # =================================================================
+            if frame_idx_column in self.meta.features:
+                if query_row_indices is not None and frame_idx_column in query_row_indices:
+                    row_indices = query_row_indices[frame_idx_column]
+                    if self._absolute_to_relative_idx is not None:
+                        rel_indices = [self._absolute_to_relative_idx[i] for i in row_indices]
+                        frame_indices_to_fetch = self.hf_dataset[rel_indices][frame_idx_column]
+                    else:
+                        frame_indices_to_fetch = self.hf_dataset[row_indices][frame_idx_column]
+                    frame_indices_to_fetch = [int(i.item()) for i in torch.tensor(frame_indices_to_fetch)]
+                else:
+                    frame_indices_to_fetch = [int(current_item[frame_idx_column].item())]
+
+                decoder = VideoDecoder(str(video_path))
+                # 安全防护：防止索引超出视频实际帧数
+                max_idx = len(decoder) - 1
+                safe_indices = [min(idx, max_idx) for idx in frame_indices_to_fetch]
+                frames = decoder.get_frames_at(indices=safe_indices).data
+                frames = frames.float() / 255.0
+                item_out[vid_key] = frames.squeeze(0)
+
+            # =================================================================
+            # 分支 2：不存在显式索引 (LeRobot 原版格式) -> 按时间戳计算
+            # =================================================================
+            else:
+                query_ts = query_timestamps[vid_key]
+                from_timestamp = ep[f"videos/{vid_key}/from_timestamp"]
+
+                # 计算相对时间戳（兼容 Unix 大数值时间戳）
+                raw_shifted_ts = [from_timestamp + (ts - ep_start_unix_ts) for ts in query_ts]
+
+                # 安全防护：防止时间戳超出视频实际时长
+                max_duration = get_video_duration_in_s(video_path) - 0.05
+                shifted_query_ts = [min(ts, max_duration) for ts in raw_shifted_ts]
+
+                frames = decode_video_frames(video_path, shifted_query_ts, self.tolerance_s, self.video_backend)
+                item_out[vid_key] = frames.squeeze(0)
+
+        return item_out
 
     def _ensure_hf_dataset_loaded(self):
         """Lazy load the HF dataset only when needed for reading."""
@@ -1064,7 +1082,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if len(self.meta.video_keys) > 0:
             current_ts = item["timestamp"].item()
             query_timestamps = self._get_query_timestamps(current_ts, query_indices)
-            video_frames = self._query_videos(query_timestamps, ep_idx)
+            video_frames = self._query_videos(item, query_indices, query_timestamps, ep_idx)
             item = {**video_frames, **item}
 
         if self.image_transforms is not None:
