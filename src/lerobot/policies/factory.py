@@ -33,6 +33,10 @@ from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.mot.configuration_mot import MoTConfig
+from lerobot.policies.mot_pi0.configuration_mot_pi0 import MoTPI0Config
+from lerobot.policies.mot_pi0_fast.configuration_mot_pi0_fast import \
+    MoTPI0FastConfig
+from lerobot.policies.mot_pi05.configuration_mot_pi05 import MoTPI05Config
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -134,6 +138,19 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.mot.modeling_mot import MoTPolicy
 
         return MoTPolicy
+    elif name == "mot_pi0":
+        from lerobot.policies.mot_pi0.modeling_mot_pi0 import MoTPI0Policy
+
+        return MoTPI0Policy
+    elif name == "mot_pi05":
+        from lerobot.policies.mot_pi05.modeling_mot_pi05 import MoTPI05Policy
+
+        return MoTPI05Policy
+    elif name == "mot_pi0_fast":
+        from lerobot.policies.mot_pi0_fast.modeling_mot_pi0_fast import \
+            MoTPI0FastPolicy
+
+        return MoTPI0FastPolicy
     else:
         try:
             return _get_policy_cls_from_policy_name(name=name)
@@ -186,6 +203,12 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return WallXConfig(**kwargs)
     elif policy_type == "mot":
         return MoTConfig(**kwargs)
+    elif policy_type == "mot_pi0":
+        return MoTPI0Config(**kwargs)
+    elif policy_type == "mot_pi05":
+        return MoTPI05Config(**kwargs)
+    elif policy_type == "mot_pi0_fast":
+        return MoTPI0FastConfig(**kwargs)
     else:
         try:
             config_cls = PreTrainedConfig.get_choice_class(policy_type)
@@ -407,7 +430,35 @@ def make_pre_post_processors(
             dataset_stats=kwargs.get("dataset_stats"),
         )
 
+    elif isinstance(policy_cfg, MoTPI0Config):
+        from lerobot.policies.mot_pi0.processor_mot_pi0 import \
+            make_mot_pi0_pre_post_processors
+
+        processors = make_mot_pi0_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, MoTPI05Config):
+        from lerobot.policies.mot_pi05.processor_mot_pi05 import \
+            make_mot_pi05_pre_post_processors
+
+        processors = make_mot_pi05_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, MoTPI0FastConfig):
+        from lerobot.policies.mot_pi0_fast.processor_mot_pi0_fast import \
+            make_mot_pi0_fast_pre_post_processors
+
+        processors = make_mot_pi0_fast_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
     elif isinstance(policy_cfg, MoTConfig):
+        # Base MoTConfig - use generic processor
         from lerobot.policies.mot.processor_mot import \
             make_mot_pre_post_processors
 

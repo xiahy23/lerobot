@@ -13,8 +13,14 @@
 # limitations under the License.
 
 from .act.configuration_act import ACTConfig as ACTConfig
-from .diffusion.configuration_diffusion import DiffusionConfig as DiffusionConfig
+from .diffusion.configuration_diffusion import \
+    DiffusionConfig as DiffusionConfig
 from .groot.configuration_groot import GrootConfig as GrootConfig
+from .mot.configuration_mot import MoTConfig as MoTConfig
+from .mot_pi0.configuration_mot_pi0 import MoTPI0Config as MoTPI0Config
+from .mot_pi0_fast.configuration_mot_pi0_fast import \
+    MoTPI0FastConfig as MoTPI0FastConfig
+from .mot_pi05.configuration_mot_pi05 import MoTPI05Config as MoTPI05Config
 from .pi0.configuration_pi0 import PI0Config as PI0Config
 from .pi0_fast.configuration_pi0_fast import PI0FastConfig as PI0FastConfig
 from .pi05.configuration_pi05 import PI05Config as PI05Config
@@ -28,6 +34,10 @@ from .xvla.configuration_xvla import XVLAConfig as XVLAConfig
 __all__ = [
     "ACTConfig",
     "DiffusionConfig",
+    "MoTConfig",
+    "MoTPI0Config",
+    "MoTPI05Config",
+    "MoTPI0FastConfig",
     "PI0Config",
     "PI05Config",
     "PI0FastConfig",
