@@ -422,6 +422,15 @@ class MoTPI0Policy(MoTPolicy):
         if config.device:
             self.to(config.device)
 
+        # Compile model if requested (for faster inference)
+        if config.compile_model:
+            torch.set_float32_matmul_precision("high")
+            self.predict_action_chunk = torch.compile(
+                self.predict_action_chunk, mode=config.compile_mode
+            )
+            # Optionally compile forward for faster training
+            self.forward = torch.compile(self.forward, mode=config.compile_mode)
+
         # Initialize action queue for inference
         self.reset()
 
