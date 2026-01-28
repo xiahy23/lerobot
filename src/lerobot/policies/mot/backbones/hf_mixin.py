@@ -23,20 +23,220 @@ of pretrained models like PaliGemma, Gemma, Llama, etc.
 
 The adapter uses string-based attribute paths to locate layers and normalization
 modules within the HuggingFace model hierarchy.
+
+Strategy Pattern:
+    This module uses the Strategy Pattern with registries for model-specific
+    operations (RoPE, gated residual). Instead of if-else chains that check
+    model type at runtime, we bind the appropriate strategy function during
+    initialization. This follows the Open-Closed Principle - to support a new
+    model, just add an entry to the registry without modifying existing code.
 """
 
 import logging
 from functools import reduce
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from lerobot.policies.mot.backbones import rope_utils
 from lerobot.policies.mot.backbones.wrapper import (BackboneWrapperConfig,
                                                     MoTBackboneWrapper)
 
 logger = logging.getLogger(__name__)
+
+
+# Preset configurations for common HuggingFace models
+HF_MODEL_PRESETS: dict[str, dict[str, str]] = {
+    "gemma": {
+        "layers_attr": "model.layers",
+        "norm_attr": "model.norm",
+        "embed_tokens_attr": "model.embed_tokens",
+        "rotary_emb_attr": "model.rotary_emb",
+    },
+    "gemma_lm": {
+        "layers_attr": "model.layers",
+        "norm_attr": "model.norm",
+        "embed_tokens_attr": "embed_tokens",
+        "rotary_emb_attr": "model.rotary_emb",
+    },
+    "paligemma": {
+        "layers_attr": "language_model.model.layers",
+        "norm_attr": "language_model.model.norm",
+        "embed_tokens_attr": "language_model.embed_tokens",
+        "rotary_emb_attr": "language_model.model.rotary_emb",
+    },
+    "paligemma_language": {
+        "layers_attr": "model.layers",
+        "norm_attr": "model.norm",
+        "embed_tokens_attr": "embed_tokens",
+        "rotary_emb_attr": "model.rotary_emb",
+    },
+    "llama": {
+        "layers_attr": "model.layers",
+        "norm_attr": "model.norm",
+        "embed_tokens_attr": "model.embed_tokens",
+        "rotary_emb_attr": "model.rotary_emb",
+    },
+    "mistral": {
+        "layers_attr": "model.layers",
+        "norm_attr": "model.norm",
+        "embed_tokens_attr": "model.embed_tokens",
+        "rotary_emb_attr": "model.rotary_emb",
+    },
+}
+
+
+def get_hf_preset(preset_name: str) -> dict[str, str]:
+    """
+    Get a preset configuration for a common HuggingFace model.
+
+    Args:
+        preset_name: Name of the preset (e.g., "gemma", "paligemma", "llama").
+
+    Returns:
+        Dictionary of attribute paths.
+
+    Raises:
+        ValueError: If preset name is not recognized.
+    """
+    if preset_name not in HF_MODEL_PRESETS:
+        raise ValueError(
+            f"Unknown preset '{preset_name}'. Available presets: {list(HF_MODEL_PRESETS.keys())}"
+        )
+    return HF_MODEL_PRESETS[preset_name].copy()
+
+
+# ============================================================================
+# Strategy Functions for RoPE (Rotary Position Embeddings)
+# ============================================================================
+# Each strategy function has the same signature:
+#   (query, key, cos, sin, unsqueeze_dim) -> (query_embed, key_embed)
+# ============================================================================
+
+def _default_rope_strategy(
+    query: Tensor,
+    key: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    unsqueeze_dim: int = 1,
+) -> tuple[Tensor, Tensor]:
+    """Default RoPE strategy using our own implementation."""
+    return rope_utils.apply_rotary_pos_emb(query, key, cos, sin, unsqueeze_dim)
+
+
+def _gemma_rope_strategy(
+    query: Tensor,
+    key: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    unsqueeze_dim: int = 1,
+) -> tuple[Tensor, Tensor]:
+    """Gemma-family RoPE strategy with float32 precision handling."""
+    try:
+        from transformers.models.gemma.modeling_gemma import \
+            apply_rotary_pos_emb as gemma_apply_rotary_pos_emb
+        return gemma_apply_rotary_pos_emb(query, key, cos, sin, unsqueeze_dim=unsqueeze_dim)
+    except ImportError:
+        logger.warning(
+            "Could not import Gemma-specific apply_rotary_pos_emb, "
+            "falling back to default implementation"
+        )
+        return _default_rope_strategy(query, key, cos, sin, unsqueeze_dim)
+
+
+def _llama_rope_strategy(
+    query: Tensor,
+    key: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    unsqueeze_dim: int = 1,
+) -> tuple[Tensor, Tensor]:
+    """Llama-family RoPE strategy."""
+    try:
+        from transformers.models.llama.modeling_llama import \
+            apply_rotary_pos_emb as llama_apply_rotary_pos_emb
+        return llama_apply_rotary_pos_emb(query, key, cos, sin, unsqueeze_dim=unsqueeze_dim)
+    except ImportError:
+        logger.warning(
+            "Could not import Llama-specific apply_rotary_pos_emb, "
+            "falling back to default implementation"
+        )
+        return _default_rope_strategy(query, key, cos, sin, unsqueeze_dim)
+
+
+# ============================================================================
+# Strategy Functions for Gated Residual Connections
+# ============================================================================
+# Each strategy function has the same signature:
+#   (original, update, gate) -> result
+# ============================================================================
+
+def _default_gated_residual_strategy(
+    original: Tensor,
+    update: Tensor,
+    gate: Tensor | None,
+) -> Tensor:
+    """Default gated residual: original + gate * update (or just original + update)."""
+    if gate is not None:
+        return original + gate * update
+    return original + update
+
+
+def _gemma_gated_residual_strategy(
+    original: Tensor,
+    update: Tensor,
+    gate: Tensor | None,
+) -> Tensor:
+    """Gemma-family gated residual strategy."""
+    if gate is not None:
+        try:
+            from transformers.models.gemma.modeling_gemma import \
+                _gated_residual as gemma_gated_residual
+            return gemma_gated_residual(original, update, gate)
+        except (ImportError, AttributeError):
+            # If not available, use the default implementation
+            pass
+    return _default_gated_residual_strategy(original, update, gate)
+
+
+# ============================================================================
+# Strategy Registries
+# ============================================================================
+# Maps model_type (from HF config) to the corresponding strategy function.
+# To support a new model, simply add an entry here - no need to modify the
+# HuggingFaceBackboneWrapper class itself (Open-Closed Principle).
+# ============================================================================
+
+# RoPE Strategy Registry: model_type -> rope_strategy_function
+ROPE_STRATEGY_REGISTRY: dict[str, Callable] = {
+    # Gemma family
+    "gemma": _gemma_rope_strategy,
+    "gemma2": _gemma_rope_strategy,
+    "paligemma": _gemma_rope_strategy,
+    # Llama family
+    "llama": _llama_rope_strategy,
+    "mistral": _llama_rope_strategy,
+    # Add more models here as needed:
+    # "qwen2": _qwen_rope_strategy,
+    # "phi": _phi_rope_strategy,
+}
+
+# Gated Residual Strategy Registry: model_type -> gated_residual_strategy_function
+GATED_RESIDUAL_STRATEGY_REGISTRY: dict[str, Callable] = {
+    # Gemma family (uses special gated residual)
+    "gemma": _gemma_gated_residual_strategy,
+    "gemma2": _gemma_gated_residual_strategy,
+    "paligemma": _gemma_gated_residual_strategy,
+    # Other models use default (no special gating)
+    # "llama": _default_gated_residual_strategy,  # Not needed, default is used
+}
+
+
+# ============================================================================
+# Utility Functions
+# ============================================================================
 
 
 def get_nested_attr(obj: Any, attr_path: str) -> Any:
@@ -202,6 +402,49 @@ class HuggingFaceBackboneWrapper(MoTBackboneWrapper):
             self._num_attention_heads = self._detect_num_attention_heads()
         if self._num_key_value_heads is None:
             self._num_key_value_heads = self._detect_num_key_value_heads()
+
+        # ====================================================================
+        # Strategy Binding (Decision made once at initialization)
+        # ====================================================================
+        # Detect model type and bind appropriate strategy functions.
+        # This avoids runtime if-else checks on every forward pass.
+        model_type = self._detect_model_type()
+        self._model_type = model_type
+
+        # Bind RoPE strategy
+        self._rope_strategy = ROPE_STRATEGY_REGISTRY.get(
+            model_type, _default_rope_strategy
+        )
+
+        # Bind gated residual strategy
+        self._gated_residual_strategy = GATED_RESIDUAL_STRATEGY_REGISTRY.get(
+            model_type, _default_gated_residual_strategy
+        )
+
+        logger.debug(
+            f"HuggingFaceBackboneWrapper initialized for model_type='{model_type}' "
+            f"with rope_strategy={self._rope_strategy.__name__}, "
+            f"gated_residual_strategy={self._gated_residual_strategy.__name__}"
+        )
+
+    def _detect_model_type(self) -> str:
+        """
+        Detect the model type from HuggingFace config.
+
+        Returns:
+            str: The model type (e.g., "gemma", "llama", "mistral").
+                 Returns "unknown" if detection fails.
+        """
+        if hasattr(self._model, "config"):
+            model_type = getattr(self._model.config, "model_type", "")
+            if model_type:
+                return model_type.lower()
+        logger.warning(
+            "Could not detect model_type from HuggingFace config. "
+            "Please specify manually if needed in the registries. "
+            "Defaulting to 'unknown'."
+        )
+        return "unknown"
 
     def _detect_hidden_size(self) -> int:
         """Auto-detect hidden size from model config or layer weights."""
@@ -369,35 +612,16 @@ class HuggingFaceBackboneWrapper(MoTBackboneWrapper):
         return self._use_adarms
 
     # ========================================================================
-    # Model-Specific Math Operations
+    # Model-Specific Math Operations (Strategy Pattern)
+    # ========================================================================
+    # These methods use strategies bound at initialization time.
+    # No runtime if-else checks - just direct function calls.
     # ========================================================================
 
-    def _is_gemma_family(self) -> bool:
-        """
-        Check if the wrapped model is from the Gemma family.
-
-        This is used to determine whether to use Gemma-specific implementations
-        for RoPE, attention, and residual connections.
-
-        Returns:
-            bool: True if the model is Gemma/PaliGemma/Gemma2, False otherwise.
-        """
-        if not hasattr(self._model, "config"):
-            return False
-        model_type = getattr(self._model.config, "model_type", "")
-        return "gemma" in model_type.lower() or "paligemma" in model_type.lower()
-
-    def _is_llama_family(self) -> bool:
-        """
-        Check if the wrapped model is from the Llama family.
-
-        Returns:
-            bool: True if the model is Llama/Llama2/Llama3/Mistral, False otherwise.
-        """
-        if not hasattr(self._model, "config"):
-            return False
-        model_type = getattr(self._model.config, "model_type", "")
-        return "llama" in model_type.lower() or "mistral" in model_type.lower()
+    @property
+    def model_type(self) -> str:
+        """Return the detected model type (e.g., 'gemma', 'llama')."""
+        return self._model_type
 
     def apply_rotary_pos_emb(
         self,
@@ -408,10 +632,10 @@ class HuggingFaceBackboneWrapper(MoTBackboneWrapper):
         unsqueeze_dim: int = 1,
     ) -> tuple[Tensor, Tensor]:
         """
-        Apply Rotary Position Embeddings with model-specific handling.
+        Apply Rotary Position Embeddings using the bound strategy.
 
-        For Gemma models, uses the transformers implementation which handles
-        precision correctly. For other models, falls back to the default.
+        The appropriate strategy function was selected at initialization time
+        based on the model type. This avoids runtime if-else checks.
 
         Args:
             query: Query states.
@@ -423,36 +647,7 @@ class HuggingFaceBackboneWrapper(MoTBackboneWrapper):
         Returns:
             tuple[Tensor, Tensor]: Rotary-embedded (query, key) tensors.
         """
-        if self._is_gemma_family():
-            # Gemma uses specific RoPE implementation with precision handling
-            try:
-                from transformers.models.gemma.modeling_gemma import \
-                    apply_rotary_pos_emb as gemma_apply_rotary_pos_emb
-                return gemma_apply_rotary_pos_emb(
-                    query, key, cos, sin, unsqueeze_dim=unsqueeze_dim
-                )
-            except ImportError:
-                logger.warning(
-                    "Could not import Gemma-specific apply_rotary_pos_emb, "
-                    "falling back to default implementation"
-                )
-
-        if self._is_llama_family():
-            # Llama has its own RoPE implementation
-            try:
-                from transformers.models.llama.modeling_llama import \
-                    apply_rotary_pos_emb as llama_apply_rotary_pos_emb
-                return llama_apply_rotary_pos_emb(
-                    query, key, cos, sin, unsqueeze_dim=unsqueeze_dim
-                )
-            except ImportError:
-                logger.warning(
-                    "Could not import Llama-specific apply_rotary_pos_emb, "
-                    "falling back to default implementation"
-                )
-
-        # Fallback to default implementation from parent class
-        return super().apply_rotary_pos_emb(query, key, cos, sin, unsqueeze_dim)
+        return self._rope_strategy(query, key, cos, sin, unsqueeze_dim)
 
     def compute_attention(
         self,
@@ -463,14 +658,13 @@ class HuggingFaceBackboneWrapper(MoTBackboneWrapper):
         scaling: float,
     ) -> tuple[Tensor, Tensor | None]:
         """
-        Compute attention with model-specific handling.
+        Compute attention using the default implementation.
 
-        For joint attention in MoT, we use the default scaled dot-product attention
-        implementation rather than model-specific ones like Gemma's eager_attention_forward.
-        This is because:
+        For joint attention in MoT, we always use the default scaled dot-product
+        attention implementation. This is because:
         1. Joint attention concatenates Q/K/V from multiple streams
-        2. Model-specific implementations may require module attributes (e.g., num_key_value_groups)
-           that don't apply correctly in the joint attention context
+        2. Model-specific implementations may require module attributes
+           (e.g., num_key_value_groups) that don't apply in joint context
         3. The default implementation handles the math correctly for all cases
 
         Args:
@@ -483,10 +677,7 @@ class HuggingFaceBackboneWrapper(MoTBackboneWrapper):
         Returns:
             tuple[Tensor, Tensor | None]: (attention output, optional weights)
         """
-        # For joint attention, use the default implementation from parent class
-        # which is model-agnostic and handles concatenated Q/K/V correctly.
-        # Model-specific implementations like Gemma's eager_attention_forward
-        # require module attributes that don't apply in the joint context.
+        # Use default implementation from parent class
         return super().compute_attention(query, key, value, attention_mask, scaling)
 
     def apply_gated_residual(
@@ -496,10 +687,10 @@ class HuggingFaceBackboneWrapper(MoTBackboneWrapper):
         gate: Tensor | None,
     ) -> Tensor:
         """
-        Apply residual connection with model-specific gating.
+        Apply residual connection using the bound strategy.
 
-        For Gemma models with AdaRMS, uses the specific _gated_residual function.
-        For other models, uses the standard residual connection.
+        The appropriate strategy function was selected at initialization time
+        based on the model type. This avoids runtime if-else checks.
 
         Args:
             original: Original tensor before transformation.
@@ -509,19 +700,7 @@ class HuggingFaceBackboneWrapper(MoTBackboneWrapper):
         Returns:
             Tensor: Result of the residual connection.
         """
-        if self._is_gemma_family() and gate is not None:
-            try:
-                # Try to import Gemma's gated residual function
-                # Note: This function may not exist in all transformers versions
-                from transformers.models.gemma.modeling_gemma import \
-                    _gated_residual as gemma_gated_residual
-                return gemma_gated_residual(original, update, gate)
-            except (ImportError, AttributeError):
-                # If not available, use the default implementation
-                pass
-
-        # Fallback to default implementation from parent class
-        return super().apply_gated_residual(original, update, gate)
+        return self._gated_residual_strategy(original, update, gate)
 
     @classmethod
     def from_pretrained(
@@ -591,64 +770,3 @@ class HuggingFaceBackboneWrapper(MoTBackboneWrapper):
             rotary_emb_attr=config.rotary_emb_attr,
             use_adarms=config.config_overrides.get("use_adarms", False),
         )
-
-
-# Preset configurations for common HuggingFace models
-HF_MODEL_PRESETS: dict[str, dict[str, str]] = {
-    "gemma": {
-        "layers_attr": "model.layers",
-        "norm_attr": "model.norm",
-        "embed_tokens_attr": "model.embed_tokens",
-        "rotary_emb_attr": "model.rotary_emb",
-    },
-    "gemma_lm": {
-        "layers_attr": "model.layers",
-        "norm_attr": "model.norm",
-        "embed_tokens_attr": "embed_tokens",
-        "rotary_emb_attr": "model.rotary_emb",
-    },
-    "paligemma": {
-        "layers_attr": "language_model.model.layers",
-        "norm_attr": "language_model.model.norm",
-        "embed_tokens_attr": "language_model.embed_tokens",
-        "rotary_emb_attr": "language_model.model.rotary_emb",
-    },
-    "paligemma_language": {
-        "layers_attr": "model.layers",
-        "norm_attr": "model.norm",
-        "embed_tokens_attr": "embed_tokens",
-        "rotary_emb_attr": "model.rotary_emb",
-    },
-    "llama": {
-        "layers_attr": "model.layers",
-        "norm_attr": "model.norm",
-        "embed_tokens_attr": "model.embed_tokens",
-        "rotary_emb_attr": "model.rotary_emb",
-    },
-    "mistral": {
-        "layers_attr": "model.layers",
-        "norm_attr": "model.norm",
-        "embed_tokens_attr": "model.embed_tokens",
-        "rotary_emb_attr": "model.rotary_emb",
-    },
-}
-
-
-def get_hf_preset(preset_name: str) -> dict[str, str]:
-    """
-    Get a preset configuration for a common HuggingFace model.
-
-    Args:
-        preset_name: Name of the preset (e.g., "gemma", "paligemma", "llama").
-
-    Returns:
-        Dictionary of attribute paths.
-
-    Raises:
-        ValueError: If preset name is not recognized.
-    """
-    if preset_name not in HF_MODEL_PRESETS:
-        raise ValueError(
-            f"Unknown preset '{preset_name}'. Available presets: {list(HF_MODEL_PRESETS.keys())}"
-        )
-    return HF_MODEL_PRESETS[preset_name].copy()
